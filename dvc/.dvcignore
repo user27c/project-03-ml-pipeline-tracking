@@ -1,0 +1,52 @@
+# DVC应该忽略的文件模式
+# 类似于.gitignore，但专用于DVC（数据版本控制）
+
+# Python缓存文件
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境目录
+venv/
+env/
+ENV/
+
+# Jupyter Notebook检查点
+.ipynb_checkpoints
+
+# IDE配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统生成的文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+
+# 不跟踪模型工件（使用MLflow进行模型跟踪）
+*.pth
+*.pkl
+*.h5
+*.onnx
+
+# 不跟踪图表和可视化文件
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# 不跟踪压缩归档文件
+*.zip
+*.tar
+*.gz

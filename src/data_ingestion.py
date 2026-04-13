@@ -400,8 +400,8 @@ class DataIngestion:
         # TODO: 实现清理
         # 提示：使用正则表达式模式匹配密码
         # 模式：r':([^@]+)@' 捕获':'和'@'之间的密码
-
-        return conn_str  # 用清理后的字符串替换
+        conn_str = re.sub(r':([^@]+)@', r':***@', conn_str)
+        return conn_str  
 
 
 # 示例用法和测试
@@ -409,7 +409,7 @@ if __name__ == "__main__":
     """
     DataIngestion类的示例用法。
 
-    TODO：
+    说明：
     1. 创建示例配置
     2. 初始化DataIngestion
     3. 测试CSV摄取
@@ -429,16 +429,17 @@ if __name__ == "__main__":
         'retry_delay': 5
     }
 
-    # TODO: 初始化DataIngestion
-    # ingestion = DataIngestion(config)
+    # 初始化DataIngestion
+    ingestion = DataIngestion(config)
 
-    # TODO: 测试CSV摄取
+    # 测试CSV摄取
     # 首先为测试创建示例CSV文件
+    df = ingestion.ingest_from_csv('data/raw/dataset.csv')
 
-    # TODO: 测试API摄取
-    # 示例：df = ingestion.ingest_from_api('https://jsonplaceholder.typicode.com/users')
+    # 测试API摄取
+    df = ingestion.ingest_from_api('https://jsonplaceholder.typicode.com/users')
 
-    # TODO: 测试save_raw_data
-    # 示例：path = ingestion.save_raw_data(df, 'api_data.csv')
+    # 测试save_raw_data
+    path = ingestion.save_raw_data(df, 'api_data.csv')
 
-    print("DataIngestion模块已加载。实现TODO以完成功能。")
+    print("DataIngestion模块已加载。实现结束。")

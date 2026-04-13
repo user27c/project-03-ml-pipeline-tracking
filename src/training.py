@@ -25,6 +25,7 @@ import time
 import mlflow
 import mlflow.pytorch
 from datetime import datetime
+# from data_ingestion import  
 
 # Configure logging
 logging.basicConfig(
@@ -613,6 +614,8 @@ if __name__ == "__main__":
 
     #  创建示例数据加载器
     # 注意：您需要使用实际数据创建实际的DataLoaders
+    train_loader = None
+    val_loader = None
     # 目前，这只是占位符
 
     #  运行训练

@@ -1,0 +1,57 @@
+# MLflow项目配置
+# 此文件定义了MLflow项目结构和入口点
+
+name: image_classification_pipeline
+
+# Docker环境（conda的替代方案）
+docker_env:
+  image: ml-pipeline-mlflow
+
+# Conda环境（如果不使用Docker）
+conda_env: conda.yaml
+
+# 不同管道阶段的入口点
+entry_points:
+  # 主训练入口点
+  main:
+    parameters:
+      data_path: {type: string, default: "data/processed"}
+      model_name: {type: string, default: "resnet18"}
+      num_epochs: {type: int, default: 20}
+      batch_size: {type: int, default: 32}
+      learning_rate: {type: float, default: 0.001}
+      optimizer: {type: string, default: "adam"}
+    command: "python src/training.py \
+              --data-path {data_path} \
+              --model-name {model_name} \
+              --num-epochs {num_epochs} \
+              --batch-size {batch_size} \
+              --learning-rate {learning_rate} \
+              --optimizer {optimizer}"
+
+  # 数据预处理入口点
+  preprocess:
+    parameters:
+      raw_data_path: {type: string, default: "data/raw"}
+      output_path: {type: string, default: "data/processed"}
+    command: "python src/preprocessing.py \
+              --raw-data-path {raw_data_path} \
+              --output-path {output_path}"
+
+  # 模型评估入口点
+  evaluate:
+    parameters:
+      model_path: {type: string}
+      test_data_path: {type: string, default: "data/processed/test.csv"}
+    command: "python src/evaluation.py \
+              --model-path {model_path} \
+              --test-data-path {test_data_path}"
+
+  # 超参数调优入口点
+  tune:
+    parameters:
+      data_path: {type: string, default: "data/processed"}
+      n_trials: {type: int, default: 10}
+    command: "python src/hyperparameter_tuning.py \
+              --data-path {data_path} \
+              --n-trials {n_trials}"
