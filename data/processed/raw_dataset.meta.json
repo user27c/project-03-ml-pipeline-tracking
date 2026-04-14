@@ -1,0 +1,1 @@
+{"filename": "raw_dataset.csv", "record_count": 50000, "column_count": 3, "columns": ["image_path", "label", "split"], "saved_at": "2026-04-13T13:20:28.516047", "file_size_bytes": 2266392}

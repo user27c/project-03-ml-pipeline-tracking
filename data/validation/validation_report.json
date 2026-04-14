@@ -1,0 +1,118 @@
+{
+  "record_count": {
+    "check": "记录数量验证",
+    "passed": true,
+    "message": "记录数 50000 在允许范围 (1000-1000000)",
+    "record_count": 50000,
+    "min_value": 1000,
+    "max_value": 1000000
+  },
+  "required_columns": {
+    "check": "必需列验证",
+    "passed": true,
+    "message": "所有必需列都存在: ['image_path', 'label', 'split']",
+    "required_columns": [
+      "image_path",
+      "label",
+      "split"
+    ],
+    "missing_columns": []
+  },
+  "label_values": {
+    "check": "标签值验证",
+    "passed": true,
+    "message": "所有标签值都有效: ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']",
+    "valid_labels": [
+      "airplane",
+      "automobile",
+      "bird",
+      "cat",
+      "deer",
+      "dog",
+      "frog",
+      "horse",
+      "ship",
+      "truck"
+    ],
+    "invalid_labels": [],
+    "unique_labels": [
+      "airplane",
+      "automobile",
+      "bird",
+      "cat",
+      "deer",
+      "dog",
+      "frog",
+      "horse",
+      "ship",
+      "truck"
+    ]
+  },
+  "no_null_values": {
+    "check": "空值验证",
+    "passed": true,
+    "message": "关键列中没有空值",
+    "null_counts": {
+      "image_path": 0,
+      "label": 0,
+      "split": 0
+    },
+    "null_columns": []
+  },
+  "image_paths_exist": {
+    "check": "图像文件路径验证",
+    "passed": true,
+    "message": "所有图像文件路径都存在 (检查了 100 个)",
+    "checked_count": 100,
+    "missing_count": 0,
+    "missing_files": []
+  },
+  "data_types": {
+    "check": "数据类型验证",
+    "passed": true,
+    "message": "所有列的数据类型正确",
+    "expected_types": {
+      "image_path": "object (string)",
+      "label": "object (string)",
+      "split": "object (string)"
+    },
+    "actual_types": {
+      "image_path": "object",
+      "label": "object",
+      "split": "object"
+    },
+    "issues": []
+  },
+  "split_distribution": {
+    "check": "数据集划分验证",
+    "passed": true,
+    "message": "数据集划分有效: {'train': 35037, 'val': 7562, 'test': 7401}",
+    "valid_splits": [
+      "train",
+      "test",
+      "val"
+    ],
+    "current_splits": [
+      "train",
+      "test",
+      "val"
+    ],
+    "split_counts": {
+      "train": 35037,
+      "val": 7562,
+      "test": 7401
+    },
+    "split_percentages": {
+      "train": "70.1%",
+      "val": "15.1%",
+      "test": "14.8%"
+    }
+  },
+  "validation_timestamp": "2026-04-13T13:20:29.603769",
+  "summary": {
+    "total_checks": 7,
+    "passed": 7,
+    "failed": 0,
+    "all_passed": true
+  }
+}

@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+
+RUN pip install cryptography
+
+COPY generate_keys.py .
+
+CMD ["python", "generate_keys.py"]

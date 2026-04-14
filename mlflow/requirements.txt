@@ -1,0 +1,9 @@
+mlflow
+psycopg2-binary
+scikit-learn
+matplotlib
+seaborn
+pandas
+numpy
+torch
+torchvision

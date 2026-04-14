@@ -1,4 +1,4 @@
 [core]
     remote = myremote
 ['remote "myremote"']
-    url = /path/to/remote/storage
+    url = /home/22-7/Dev/ai-infra-learn/ai-infra-project/junior-engineer/project-03-ml-pipeline-tracking/dvc/remote

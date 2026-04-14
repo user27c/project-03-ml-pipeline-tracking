@@ -266,7 +266,6 @@ class ModelTrainer:
             num_features = model.fc.in_features
             # 替换最终层
             model.fc = nn.Linear(num_features, num_classes)
-            pass
 
         elif model_name == "mobilenet_v2":
             # 加载预训练的MobileNetV2
@@ -275,7 +274,6 @@ class ModelTrainer:
             num_features = model.classifier[1].in_features
             # 替换最终层
             model.classifier[1] = nn.Linear(num_features, num_classes)
-            pass
 
         else:
             raise ValueError(f"未知模型: {model_name}")
@@ -356,7 +354,7 @@ class ModelTrainer:
 
             # 可选：每N个批次记录进度
             if batch_idx % 10 == 0:
-                logger.debug(f"批次 {batch_idx}/{len(train_loader)}，损失: {0:.4f}")
+                logger.debug(f"批次 {batch_idx}/{len(train_loader)}，损失: {loss:.4f}")
 
         # 计算轮次统计
         epoch_loss = running_loss / len(train_loader)
@@ -614,9 +612,13 @@ if __name__ == "__main__":
 
     #  创建示例数据加载器
     # 注意：您需要使用实际数据创建实际的DataLoaders
-    train_loader = None
-    val_loader = None
     # 目前，这只是占位符
+    # 示例：
+    from src.dataset import ImageClassificationDataset, create_data_loaders
+    train_loader, val_loader, test_loader = create_data_loaders(
+        data_dir='data/raw/cifar-10',
+        batch_size=training_config['batch_size']
+    )
 
     #  运行训练
     model, best_acc = trainer.train(
@@ -626,5 +628,5 @@ if __name__ == "__main__":
         params=training_config
     )
 
-    print("ModelTrainer模块已加载。实现TODO以完成功能。")
+    print("ModelTrainer模块已加载。")
     print("别忘了启动MLflow服务器: mlflow server --port 5000")
