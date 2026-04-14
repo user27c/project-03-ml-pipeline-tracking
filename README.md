@@ -131,8 +131,10 @@ project-03-ml-pipeline-tracking/
 |------|------|
 | `ML_PIPELINE_PROJECT_ROOT` | 项目根绝对路径（Docker 常为 `/opt/airflow`） |
 | `MLFLOW_TRACKING_URI` | MLflow 跟踪地址 |
+| `MLFLOW_ARTIFACT_BUCKET` | MLflow 工件桶名（默认 `mlflow`）。DAG 在训练前会尝试自动检查/创建该桶。 |
 | `FEATURE_STORE_POSTGRES_HOST` / `FEATURE_STORE_POSTGRES_*` | 特征库连接 |
 | `ML_PIPELINE_ALERT_EMAIL` | 若设置，则启用失败邮件相关默认行为（视 Airflow SMTP 配置而定） |
+| `ML_PIPELINE_REUSE_TRAIN_CACHE` | 设为 `1` / `true` 时，若 `models/best_model.pth` 与 `models/train_cache_meta.json` 存在且与当前 `all_splits.csv` 的 mtime、关键超参数一致，则 **跳过训练**（调下游步骤时省时间）。见 DAG 内说明；**跳过时不会新建 MLflow 训练 Run**，`register_model` 仍关联「最近一次 Run」，需注意一致性。 |
 
 ---
 
@@ -155,6 +157,7 @@ project-03-ml-pipeline-tracking/
 
 ## 8. 文档与扩展阅读
 
+- [`docs/technology/`](docs/technology/)：**技术栈说明、在本项目中的用法、Mermaid 架构图与踩坑要点**（[`项目技术详解.md`](docs/technology/项目技术详解.md)）。
 - [`requirements.md`](requirements.md)：功能清单与学习目标（课程向）。
 - [`architecture.md`](architecture.md)：组件、数据流、技术决策。
 - 上游官方文档：[MLflow](https://mlflow.org/docs/latest/index.html)、[Airflow](https://airflow.apache.org/docs/)、[DVC](https://dvc.org/doc)。

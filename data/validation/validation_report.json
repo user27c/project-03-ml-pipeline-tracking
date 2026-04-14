@@ -89,13 +89,13 @@
     "message": "数据集划分有效: {'train': 35037, 'val': 7562, 'test': 7401}",
     "valid_splits": [
       "val",
-      "train",
-      "test"
+      "test",
+      "train"
     ],
     "current_splits": [
       "val",
-      "train",
-      "test"
+      "test",
+      "train"
     ],
     "split_counts": {
       "train": 35037,
@@ -108,7 +108,7 @@
       "test": "14.8%"
     }
   },
-  "validation_timestamp": "2026-04-14T01:26:24.773932",
+  "validation_timestamp": "2026-04-14T05:46:22.217920",
   "summary": {
     "total_checks": 7,
     "passed": 7,

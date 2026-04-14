@@ -8,10 +8,12 @@
 - MLFLOW_TRACKING_URI：宿主机默认 http://127.0.0.1:5000；Docker 内未设置时默认 http://mlflow:5000
 - FEATURE_STORE_POSTGRES_*：特征库连接。未设置主机时：在 Docker 容器内（存在 /.dockerenv）默认用
   服务名 postgres；在宿主机上默认 127.0.0.1（本机 conda + 本机 Postgres）
+- ML_PIPELINE_REUSE_TRAIN_CACHE：设为 1/true 时，若存在有效训练缓存（见 train_model 内说明）则跳过长时间训练。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -141,6 +143,131 @@ def _xcom_safe_metrics(metrics: dict) -> dict:
     return out
 
 
+_TRAIN_CACHE_PARAM_KEYS = (
+    "model_name",
+    "num_epochs",
+    "batch_size",
+    "learning_rate",
+    "optimizer",
+    "lr_step_size",
+    "lr_gamma",
+    "early_stopping_patience",
+)
+
+
+def _train_cache_meta_path() -> Path:
+    return Path(PIPELINE_CONFIG["model_save_path"]) / "train_cache_meta.json"
+
+
+def _reuse_train_cache_enabled() -> bool:
+    return os.environ.get("ML_PIPELINE_REUSE_TRAIN_CACHE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _try_reuse_train_cache(all_splits_path: str, params: dict) -> tuple[bool, float]:
+    """
+    若启用缓存且磁盘上存在与当前数据mtime、关键超参数一致的 checkpoint，则跳过训练。
+
+    注意：跳过时不会新建 MLflow Training Run；evaluate仍使用 best_model.pth。
+    register_model 仍取「最近一次」Run注册，若你依赖注册与本次权重严格一致，请勿开缓存或改注册逻辑。
+    """
+    if not _reuse_train_cache_enabled():
+        return False, 0.0
+    model_path = Path(PIPELINE_CONFIG["model_save_path"]) / "best_model.pth"
+    meta_path = _train_cache_meta_path()
+    if not model_path.is_file() or not meta_path.is_file():
+        logger.info("训练缓存未命中：缺少 best_model.pth 或 train_cache_meta.json")
+        return False, 0.0
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("训练缓存元数据读取失败，将完整训练: %s", e)
+        return False, 0.0
+    resolved_splits = str(Path(all_splits_path).resolve())
+    if meta.get("all_splits_path") != resolved_splits:
+        logger.info("训练缓存未命中：all_splits 路径与缓存不一致")
+        return False, 0.0
+    try:
+        current_mtime_ns = Path(all_splits_path).stat().st_mtime_ns
+    except OSError:
+        return False, 0.0
+    if meta.get("all_splits_mtime_ns") != current_mtime_ns:
+        logger.info("训练缓存未命中：all_splits.csv 已更新（mtime 变化）")
+        return False, 0.0
+    cached_params = meta.get("params") or {}
+    for key in _TRAIN_CACHE_PARAM_KEYS:
+        if cached_params.get(key) != params.get(key):
+            logger.info("训练缓存未命中：超参数 %s 与缓存不一致", key)
+            return False, 0.0
+    acc = float(meta.get("best_val_acc", 0.0))
+    logger.warning(
+        "使用训练缓存：跳过训练（best_model.pth + train_cache_meta.json）。"
+        "MLflow 不会新建本次训练 Run；若需注册与权重严格一致请关闭 ML_PIPELINE_REUSE_TRAIN_CACHE。"
+    )
+    return True, acc
+
+
+def _write_train_cache_meta(all_splits_path: str, best_val_acc: float, params: dict) -> None:
+    save_dir = Path(PIPELINE_CONFIG["model_save_path"])
+    save_dir.mkdir(parents=True, exist_ok=True)
+    p = Path(all_splits_path).resolve()
+    meta = {
+        "all_splits_path": str(p),
+        "all_splits_mtime_ns": p.stat().st_mtime_ns,
+        "best_val_acc": float(best_val_acc),
+        "params": {k: params.get(k) for k in _TRAIN_CACHE_PARAM_KEYS},
+        "written_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _train_cache_meta_path().write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    logger.info("已写入训练缓存元数据: %s", _train_cache_meta_path())
+
+
+def _ensure_mlflow_artifact_bucket() -> None:
+    """
+    在训练前确保 MLflow artifact bucket 存在，避免首次运行时报 NoSuchBucket。
+    """
+    endpoint = os.environ.get("MLFLOW_S3_ENDPOINT_URL", "http://minio:9000")
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    bucket = os.environ.get("MLFLOW_ARTIFACT_BUCKET", "mlflow")
+
+    if not access_key or not secret_key:
+        logger.warning(
+            "跳过 bucket 自动检查：缺少 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+        )
+        return
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        logger.warning("跳过 bucket 自动检查：未安装 boto3")
+        return
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    try:
+        s3.head_bucket(Bucket=bucket)
+        logger.info("MLflow artifact bucket 已存在: %s", bucket)
+        return
+    except ClientError as e:
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code not in ("404", "NoSuchBucket", "NotFound"):
+            logger.warning("检查 bucket 失败，继续尝试创建: %s", e)
+
+    s3.create_bucket(Bucket=bucket)
+    logger.warning("已自动创建 MLflow artifact bucket: %s", bucket)
+
+
 # ============================================================================
 # DAG配置
 # ============================================================================
@@ -220,6 +347,25 @@ def version_data_dvc(**context):
 
     root = PROJECT_ROOT
     cwd = str(root)
+    dvc_dir = root / ".dvc"
+    git_dir = root / ".git"
+
+    # Airflow Docker 服务默认只挂载 dags/src/data 等目录，不一定包含完整的 DVC/Git 仓库元数据。
+    # 在这种集成环境下，DVC 版本化作为可选步骤处理，避免整条训练链因为仓库元数据缺失而中断。
+    if not dvc_dir.exists():
+        logger.warning(
+            "Skipping DVC versioning because %s is missing. "
+            "If you want to run DVC inside Airflow, mount the repository metadata into the container.",
+            dvc_dir,
+        )
+        return "DVC versioning skipped (.dvc repo metadata missing)"
+    if not git_dir.exists():
+        logger.warning(
+            "Skipping DVC versioning because %s is missing. "
+            "Git metadata is required for this workflow's dvc/git commands.",
+            git_dir,
+        )
+        return "DVC versioning skipped (.git metadata missing)"
     try:
         subprocess.run(
             ["dvc", "add", "data/processed"], check=True, cwd=cwd, capture_output=True, text=True
@@ -248,7 +394,11 @@ def version_data_dvc(**context):
         logger.warning("DVC/Git 未安装或不在 PATH，跳过版本化: %s", e)
         return "DVC versioning skipped (dvc/git not available)"
     except subprocess.CalledProcessError as e:
-        logger.error("DVC versioning failed: %s", e.stderr or e.stdout or e)
+        message = e.stderr or e.stdout or str(e)
+        if "not inside of a DVC repository" in message:
+            logger.warning("Skipping DVC versioning: %s", message.strip())
+            return "DVC versioning skipped (not inside a DVC repository)"
+        logger.error("DVC versioning failed: %s", message)
         raise
     logger.info("Data versioning complete")
     return "DVC versioning successful"
@@ -296,20 +446,9 @@ def train_model(**context):
     from src.dataset import create_data_loaders
     from src.training import MLflowTracker, ModelTrainer
 
-    all_splits_path = _get_all_splits_csv_path(context)
-    root_dir = str(PROJECT_ROOT)
-    train_loader, val_loader, _ = create_data_loaders(
-        csv_path=all_splits_path,
-        root_dir=root_dir,
-        batch_size=32,
-    )
-    num_classes = train_loader.dataset.num_classes
-    logger.info("检测到 %s 个类别", num_classes)
+    _ensure_mlflow_artifact_bucket()
 
-    tracker = MLflowTracker(
-        tracking_uri=PIPELINE_CONFIG["mlflow_tracking_uri"],
-        experiment_name=PIPELINE_CONFIG["experiment_name"],
-    )
+    all_splits_path = _get_all_splits_csv_path(context)
     params = {
         "model_name": "resnet18",
         "num_epochs": 10,
@@ -320,6 +459,29 @@ def train_model(**context):
         "lr_gamma": 0.1,
         "early_stopping_patience": 3,
     }
+    reused, cached_acc = _try_reuse_train_cache(all_splits_path, params)
+    if reused:
+        context["task_instance"].xcom_push(
+            key="best_val_acc", value=float(cached_acc)
+        )
+        context["task_instance"].xcom_push(key="train_cache_hit", value=True)
+        return "Training skipped (reused checkpoint and cache meta)"
+
+    root_dir = str(PROJECT_ROOT)
+    train_loader, val_loader, _ = create_data_loaders(
+        csv_path=all_splits_path,
+        root_dir=root_dir,
+        batch_size=params["batch_size"],
+        num_workers=0,
+        pin_memory=False,
+    )
+    num_classes = train_loader.dataset.num_classes
+    logger.info("检测到 %s 个类别", num_classes)
+
+    tracker = MLflowTracker(
+        tracking_uri=PIPELINE_CONFIG["mlflow_tracking_uri"],
+        experiment_name=PIPELINE_CONFIG["experiment_name"],
+    )
     trainer = ModelTrainer(PIPELINE_CONFIG, tracker)
     model, best_val_acc = trainer.train(
         train_loader=train_loader,
@@ -327,16 +489,20 @@ def train_model(**context):
         num_classes=num_classes,
         params=params,
     )
+    _write_train_cache_meta(all_splits_path, best_val_acc, params)
     context["task_instance"].xcom_push(
         key="best_val_acc", value=float(best_val_acc)
     )
+    context["task_instance"].xcom_push(key="train_cache_hit", value=False)
     logger.info("Model training complete")
     return "Training successful"
 
 
 def evaluate_model(**context):
     logger.info("Starting model evaluation...")
+    from collections import OrderedDict
     import torch
+    import torchvision.models as models
 
     from src.dataset import create_data_loaders
     from src.evaluation import ModelEvaluator
@@ -346,16 +512,29 @@ def evaluate_model(**context):
         csv_path=all_splits_path,
         root_dir=str(PROJECT_ROOT),
         batch_size=32,
+        num_workers=0,
+        pin_memory=False,
     )
     model_path = f"{PIPELINE_CONFIG['model_save_path']}/best_model.pth"
     try:
-        model = torch.load(
+        model_payload = torch.load(
             model_path,
             map_location=torch.device("cpu"),
             weights_only=False,
         )
     except TypeError:
-        model = torch.load(model_path, map_location=torch.device("cpu"))
+        model_payload = torch.load(model_path, map_location=torch.device("cpu"))
+
+    # training.py 保存的是 state_dict；这里兼容 state_dict 与完整模型对象两种格式。
+    if isinstance(model_payload, (dict, OrderedDict)):
+        num_classes = test_loader.dataset.num_classes
+        model = models.resnet18(weights=None)
+        model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+        model.load_state_dict(model_payload)
+        logger.info("Loaded model from state_dict checkpoint")
+    else:
+        model = model_payload
+        logger.info("Loaded serialized model object checkpoint")
 
     class_names = [
         "airplane",

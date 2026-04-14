@@ -65,6 +65,7 @@ services:
     environment:
       MLFLOW_BACKEND_STORE_URI: postgresql://mlflow:mlflow@postgres:5432/mlflow
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_SERVER_ALLOWED_HOSTS: mlflow,localhost,127.0.0.1
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
     depends_on:
@@ -77,6 +78,7 @@ services:
       --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
       --default-artifact-root s3://mlflow/
       --host 0.0.0.0
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
       --port 5000
     networks:
       - ml_pipeline_network
@@ -120,6 +122,10 @@ services:
       AIRFLOW__WEBSERVER__SECRET_KEY: '_IsrGsL6TgSHsrCwXjkdz4PlKqUv-oCz24qj4hsczpQ'
       ML_PIPELINE_PROJECT_ROOT: /opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow
@@ -159,6 +165,10 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       ML_PIPELINE_PROJECT_ROOT: /opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow
@@ -196,6 +206,10 @@ services:
       AIRFLOW__CORE__FERNET_KEY: 'RiVQihR6Dj5AmGK_ygBAMplD4GFK5rc-AAFGkCvMMtU='
       ML_PIPELINE_PROJECT_ROOT: /opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow
