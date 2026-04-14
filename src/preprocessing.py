@@ -185,7 +185,7 @@ class DataPreprocessor:
             raise ValueError(f"列'{label_column}'未在DataFrame中找到")
 
         # 获取编码前的唯一标签
-        unique_labels = None  # 用df[label_column].unique()替换
+        unique_labels = df[label_column].unique()
 
         # 拟合并转换标签
         encoded = self.label_encoder.fit_transform(df[label_column])
@@ -196,7 +196,7 @@ class DataPreprocessor:
 
         # 保存标签编码器
         encoder_path = self.artifacts_path / 'label_encoder.pkl'
-        # 提示：joblib.dump(self.label_encoder, encoder_path)
+        joblib.dump(self.label_encoder, encoder_path)
 
         # 创建并保存标签映射
         label_mapping = {label: encoded for label, encoded in zip(unique_labels, range(len(unique_labels)))}
@@ -330,8 +330,9 @@ class DataPreprocessor:
             stratify=train_val[stratify_column] if stratify_column else None
         )
 
-        #记录划分大小
-        logger.info(f"划分大小 - 训练：{0}，验证：{0}，测试：{0}")
+        logger.info(
+            f"划分大小 - 训练：{len(train)}，验证：{len(val)}，测试：{len(test)}"
+        )
 
         #如果分层则记录类别分布
         if stratify_column:
@@ -386,12 +387,15 @@ class DataPreprocessor:
             'test': test
         }
 
+        combined_frames = []
         for split_name, split_df in splits.items():
             # 创建文件路径
             csv_path = self.processed_data_path / f"{split_name}.csv"
-
+            out_df = split_df.copy()
+            out_df["split"] = split_name
+            combined_frames.append(out_df)
             # 保存为CSV
-            split_df.to_csv(csv_path, index=False)
+            out_df.to_csv(csv_path, index=False)
 
             # 创建元数据
             metadata = {
@@ -400,7 +404,7 @@ class DataPreprocessor:
                 "record_count": len(split_df),
                 "columns": split_df.columns.tolist(),
                 "shape": (len(split_df.columns), len(split_df)),
-                "created_at": datetime.now()
+                "created_at": datetime.now().isoformat()
             }
 
             # 保存元数据
@@ -412,6 +416,12 @@ class DataPreprocessor:
             paths[split_name] = csv_path
 
             logger.info(f"将{split_name}划分保存到{csv_path}（{len(split_df)}条记录）")
+
+        merged = pd.concat(combined_frames, ignore_index=True)
+        all_splits_path = self.processed_data_path / "all_splits.csv"
+        merged.to_csv(all_splits_path, index=False)
+        paths["all_splits"] = all_splits_path
+        logger.info(f"已写入合并划分文件 {all_splits_path}（{len(merged)} 行）")
 
         return paths
 

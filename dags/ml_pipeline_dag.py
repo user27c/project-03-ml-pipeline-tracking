@@ -3,56 +3,107 @@
 
 此DAG编排从数据摄取到模型注册的完整ML管道。
 
-学习目标：
-- 设计具有适当任务依赖关系的Airflow DAG
-- 为ML任务实现PythonOperator
-- 使用XCom进行任务间通信
-- 处理错误和重试
-- 调度管道
-
+路径与 MLflow 地址通过环境变量配置，便于 conda 本地与 Docker 一致运行：
+- ML_PIPELINE_PROJECT_ROOT：项目根（可选；默认取本文件上级目录）
+- MLFLOW_TRACKING_URI：默认 http://127.0.0.1:5000（conda）；Docker 可设为 http://mlflow:5000
+- FEATURE_STORE_POSTGRES_*：特征库连接（默认与 docker-compose 中 Postgres/mlflow 一致）
 """
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.email import EmailOperator
 from airflow.utils.dates import days_ago
-from datetime import datetime, timedelta
-import sys
-from pathlib import Path
 
-# 将项目源代码添加到Python路径
-sys.path.insert(0, '/path/to/src')
 
-import logging
+def _project_root() -> Path:
+    env = os.environ.get("ML_PIPELINE_PROJECT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _project_root()
+_root_str = str(PROJECT_ROOT)
+if _root_str not in sys.path:
+    sys.path.insert(0, _root_str)
 
 logger = logging.getLogger(__name__)
+
+
+def _build_pipeline_config() -> dict:
+    root = PROJECT_ROOT
+    return {
+        "raw_data_path": str(root / "data" / "raw"),
+        "processed_data_path": str(root / "data" / "processed"),
+        "model_save_path": str(root / "models"),
+        "artifacts_path": str(root / "artifacts"),
+        "mlflow_tracking_uri": os.environ.get(
+            "MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"
+        ),
+        "experiment_name": os.environ.get(
+            "MLFLOW_EXPERIMENT_NAME", "image_classification_pipeline"
+        ),
+    }
+
+
+PIPELINE_CONFIG = _build_pipeline_config()
+
+
+def _xcom_safe_metrics(metrics: dict) -> dict:
+    """将 numpy 等类型转为 JSON/XCom 可序列化的 Python 内置类型。"""
+    try:
+        import numpy as np
+    except ImportError:
+        np = None  # type: ignore
+
+    out: dict = {}
+    for k, v in metrics.items():
+        if hasattr(v, "item") and callable(getattr(v, "item")):
+            try:
+                out[k] = float(v.item())
+                continue
+            except (ValueError, TypeError):
+                pass
+        if isinstance(v, (float, int)) and not isinstance(v, bool):
+            out[k] = float(v)
+        elif np is not None and isinstance(v, np.ndarray):
+            out[k] = v.astype(float).tolist()
+        elif isinstance(v, list):
+            conv = []
+            for x in v:
+                if hasattr(x, "item") and callable(getattr(x, "item")):
+                    conv.append(float(x.item()))
+                else:
+                    conv.append(float(x))
+            out[k] = conv
+        else:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                out[k] = v
+    return out
 
 
 # ============================================================================
 # DAG配置
 # ============================================================================
 
-# 为所有任务定义default_args
 default_args = {
-    'owner': 'ml-team',
-    'depends_on_past': False,
-    'email': ['x22han7@qq.com'],  # TODO: 更新为你的邮箱
-    'email_on_failure': True,
-    'email_on_retry': False,
-    'retries': 3,  # TODO: 设置适当的重试次数
-    'retry_delay': timedelta(minutes=5),  # TODO: 设置重试延迟
-    # TODO: 添加execution_timeout
-    'execution_timeout': timedelta(hours=2),
-}
-
-# TODO: 定义管道配置
-PIPELINE_CONFIG = {
-    'raw_data_path': '/opt/airflow/data/raw',
-    'processed_data_path': '/opt/airflow/data/processed',
-    'model_save_path': '/opt/airflow/models',
-    'artifacts_path': '/opt/airflow/artifacts',
-    'mlflow_tracking_uri': 'http://mlflow:5000',
-    'experiment_name': 'image_classification_pipeline',
+    "owner": "ml-team",
+    "depends_on_past": False,
+    "email": [os.environ.get("ML_PIPELINE_ALERT_EMAIL", "")] if os.environ.get("ML_PIPELINE_ALERT_EMAIL") else [],
+    "email_on_failure": bool(os.environ.get("ML_PIPELINE_ALERT_EMAIL")),
+    "email_on_retry": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+    "execution_timeout": timedelta(hours=2),
 }
 
 
@@ -60,421 +111,355 @@ PIPELINE_CONFIG = {
 # 任务函数
 # ============================================================================
 
+
 def ingest_data(**context):
-    """
-    任务：从源摄取数据。
-
-    TODO：
-    1. 导入DataIngestion类
-    2. 使用配置初始化
-    3. 从CSV（或API、数据库）摄取数据
-    4. 保存原始数据
-    5. 将数据路径推送到XCom供下一个任务使用
-    6. 返回成功消息
-    """
     logger.info("Starting data ingestion...")
+    from src.data_ingestion import DataIngestion
 
-    # TODO: 导入DataIngestion
-    # from src.data_ingestion import DataIngestion
-
-    # TODO: 初始化摄取
-    # ingestion = DataIngestion(PIPELINE_CONFIG)
-
-    # TODO: 摄取数据
-    # 示例：df = ingestion.ingest_from_csv('/opt/airflow/data/source/dataset.csv')
-
-    # TODO: 保存原始数据
-    # output_path = ingestion.save_raw_data(df, 'raw_dataset.csv')
-
-    # TODO: 将路径推送到XCom
-    # context['task_instance'].xcom_push(key='raw_data_path', value=str(output_path))
-
+    ingestion = DataIngestion(PIPELINE_CONFIG)
+    source_csv = Path(PIPELINE_CONFIG["raw_data_path"]) / "cifar-10" / "dataset.csv"
+    df = ingestion.ingest_from_csv(str(source_csv))
+    output_path = ingestion.save_raw_data(df, "raw_dataset.csv")
+    context["task_instance"].xcom_push(key="raw_data_path", value=str(output_path))
     logger.info("Data ingestion complete")
     return "Data ingestion successful"
 
 
 def validate_data(**context):
-    """
-    任务：使用Great Expectations验证数据质量。
-
-    TODO：
-    1. 从XCom拉取原始数据路径
-    2. 加载数据
-    3. 初始化DataValidator
-    4. 创建期望套件
-    5. 运行验证
-    6. 如果验证失败则抛出错误
-    7. 返回验证结果
-    """
     logger.info("Starting data validation...")
+    raw_data_path = context["task_instance"].xcom_pull(
+        task_ids="ingest_data", key="raw_data_path"
+    )
+    import pandas as pd
 
-    # TODO: 从上一个任务拉取数据路径
-    # raw_data_path = context['task_instance'].xcom_pull(
-    #     task_ids='ingest_data',
-    #     key='raw_data_path'
-    # )
+    df = pd.read_csv(raw_data_path)
+    from src.data_validation import DataValidator
 
-    # TODO: 加载数据
-    # import pandas as pd
-    # df = pd.read_csv(raw_data_path)
-
-    # TODO: 导入并初始化验证器
-    # from src.data_validation import DataValidator
-    # validator = DataValidator()
-
-    # TODO: 创建期望
-    # validator.create_expectation_suite("data_quality_suite")
-
-    # TODO: 验证
-    # validation_passed = validator.validate_data(df, "data_quality_suite")
-
-    # TODO: 如果验证失败则抛出错误
-    # if not validation_passed:
-    #     raise ValueError("Data validation failed! Check validation report.")
-
+    validator = DataValidator()
+    validation_results = validator.run_validation(df)
+    if not validation_results.get("all_passed", False):
+        raise ValueError("Data validation failed! Check validation report.")
     logger.info("Data validation passed")
     return "Data validation successful"
 
 
 def preprocess_data(**context):
-    """
-    任务：预处理数据（清洗、编码、分割）。
-
-    TODO：
-    1. 从XCom拉取原始数据路径
-    2. 加载数据
-    3. 初始化DataPreprocessor
-    4. 运行预处理管道
-    5. 将完成状态推送到XCom
-    6. 返回成功消息
-    """
     logger.info("Starting data preprocessing...")
+    raw_data_path = context["task_instance"].xcom_pull(
+        task_ids="ingest_data", key="raw_data_path"
+    )
+    import pandas as pd
 
-    # TODO: 拉取数据路径
-    # raw_data_path = context['task_instance'].xcom_pull(
-    #     task_ids='ingest_data',
-    #     key='raw_data_path'
-    # )
+    from src.preprocessing import DataPreprocessor
 
-    # TODO: 加载数据
-    # import pandas as pd
-    # df = pd.read_csv(raw_data_path)
-
-    # TODO: 导入并初始化预处理器
-    # from src.preprocessing import DataPreprocessor
-    # preprocessor = DataPreprocessor(PIPELINE_CONFIG)
-
-    # TODO: 运行管道
-    # train, val, test = preprocessor.run_pipeline(df, label_column='label')
-
-    # TODO: 将状态推送到XCom
-    # context['task_instance'].xcom_push(key='preprocessing_complete', value=True)
-
+    df = pd.read_csv(raw_data_path)
+    preprocessor = DataPreprocessor(PIPELINE_CONFIG)
+    preprocessor.run_pipeline(df, label_column="label")
+    all_splits = Path(PIPELINE_CONFIG["processed_data_path"]) / "all_splits.csv"
+    if not all_splits.is_file():
+        raise FileNotFoundError(f"Expected merged splits file missing: {all_splits}")
+    context["task_instance"].xcom_push(key="all_splits_csv", value=str(all_splits))
+    context["task_instance"].xcom_push(key="preprocessing_complete", value=True)
     logger.info("Data preprocessing complete")
     return "Preprocessing successful"
 
 
 def version_data_dvc(**context):
-    """
-    任务：使用DVC版本化处理后的数据。
-
-    TODO：
-    1. 在处理后的数据目录上运行dvc add
-    2. 将DVC文件提交到git
-    3. 推送到DVC远程存储
-    4. 使用版本标记
-    5. 返回成功消息
-
-    注意：这需要在Airflow容器中设置DVC和Git
-    """
     logger.info("Versioning data with DVC...")
+    import subprocess
 
-    # TODO: 导入subprocess
-    # import subprocess
-
-    # TODO: 将处理后的数据添加到DVC
-    # try:
-    #     subprocess.run(['dvc', 'add', 'data/processed'], check=True)
-    #     subprocess.run(['dvc', 'push'], check=True)
-    #     subprocess.run(['git', 'add', 'data/processed.dvc', '.gitignore'], check=True)
-    #     subprocess.run(
-    #         ['git', 'commit', '-m', f'Data version {datetime.now().isoformat()}'],
-    #         check=True
-    #     )
-    # except subprocess.CalledProcessError as e:
-    #     logger.error(f"DVC versioning failed: {e}")
-    #     raise
-
+    root = PROJECT_ROOT
+    cwd = str(root)
+    try:
+        subprocess.run(
+            ["dvc", "add", "data/processed"], check=True, cwd=cwd, capture_output=True, text=True
+        )
+        subprocess.run(["dvc", "push"], check=True, cwd=cwd, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "add", "data/processed.dvc", ".gitignore"],
+            check=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                f"Data version {datetime.now().isoformat()}",
+            ],
+            check=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        logger.warning("DVC/Git 未安装或不在 PATH，跳过版本化: %s", e)
+        return "DVC versioning skipped (dvc/git not available)"
+    except subprocess.CalledProcessError as e:
+        logger.error("DVC versioning failed: %s", e.stderr or e.stdout or e)
+        raise
     logger.info("Data versioning complete")
     return "DVC versioning successful"
 
 
+def store_features(**context):
+    logger.info("Starting feature storage...")
+    import pandas as pd
+
+    from src.feature_store import FeatureStore
+
+    all_splits_path = context["task_instance"].xcom_pull(
+        task_ids="preprocess_data", key="all_splits_csv"
+    )
+    if not all_splits_path:
+        raise ValueError("XCom missing all_splits_csv from preprocess_data")
+    df = pd.read_csv(all_splits_path)
+    train_df = df[df["split"] == "train"]
+    label_col = "label_encoded" if "label_encoded" in train_df.columns else "label"
+
+    host = os.environ.get(
+        "FEATURE_STORE_POSTGRES_HOST",
+        os.environ.get("POSTGRES_HOST", "localhost"),
+    )
+    port = int(os.environ.get("FEATURE_STORE_POSTGRES_PORT", "5432"))
+    database = os.environ.get("FEATURE_STORE_POSTGRES_DB", "mlflow")
+    user = os.environ.get("FEATURE_STORE_POSTGRES_USER", "mlflow")
+    password = os.environ.get("FEATURE_STORE_POSTGRES_PASSWORD", "mlflow")
+
+    feature_store = FeatureStore(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+    )
+    feature_store.create_table()
+    inserted_count = feature_store.save_features_from_dataframe(
+        train_df,
+        image_id_column="image_path",
+        label_column=label_col,
+        version="1.0",
+    )
+    feature_store.close()
+    context["task_instance"].xcom_push(key="features_stored", value=int(inserted_count))
+    logger.info("Feature storage complete: %s features stored", inserted_count)
+    return "Features stored successfully"
+
+
 def train_model(**context):
-    """
-    任务：使用MLflow跟踪训练ML模型。
-
-    TODO：
-    1. 初始化MLflowTracker
-    2. 加载预处理数据
-    3. 创建数据加载器
-    4. 定义训练参数
-    5. 初始化ModelTrainer
-    6. 运行训练
-    7. 将最佳验证准确率推送到XCom
-    8. 返回成功消息
-    """
     logger.info("Starting model training...")
+    from src.dataset import create_data_loaders
+    from src.training import MLflowTracker, ModelTrainer
 
-    # TODO: 导入所需的类
-    # from src.training import MLflowTracker, ModelTrainer
-    # import pandas as pd
+    all_splits_path = context["task_instance"].xcom_pull(
+        task_ids="preprocess_data", key="all_splits_csv"
+    )
+    if not all_splits_path:
+        raise ValueError("XCom missing all_splits_csv")
+    root_dir = str(PROJECT_ROOT)
+    train_loader, val_loader, _ = create_data_loaders(
+        csv_path=all_splits_path,
+        root_dir=root_dir,
+        batch_size=32,
+    )
+    num_classes = train_loader.dataset.num_classes
+    logger.info("检测到 %s 个类别", num_classes)
 
-    # TODO: 初始化MLflow跟踪器
-    # tracker = MLflowTracker(
-    #     tracking_uri=PIPELINE_CONFIG['mlflow_tracking_uri'],
-    #     experiment_name=PIPELINE_CONFIG['experiment_name']
-    # )
-
-    # TODO: 加载处理后的数据
-    # train_df = pd.read_csv(f"{PIPELINE_CONFIG['processed_data_path']}/train.csv")
-    # val_df = pd.read_csv(f"{PIPELINE_CONFIG['processed_data_path']}/val.csv")
-
-    # TODO: 创建数据加载器
-    # 注意：你需要为数据实现一个Dataset类
-    # train_loader = ...
-    # val_loader = ...
-
-    # TODO: 定义训练参数
+    tracker = MLflowTracker(
+        tracking_uri=PIPELINE_CONFIG["mlflow_tracking_uri"],
+        experiment_name=PIPELINE_CONFIG["experiment_name"],
+    )
     params = {
-        'model_name': 'resnet18',
-        'num_epochs': 10,
-        'batch_size': 32,
-        'learning_rate': 0.001,
-        'optimizer': 'adam',
-        'lr_step_size': 5,
-        'lr_gamma': 0.1,
-        'early_stopping_patience': 3
+        "model_name": "resnet18",
+        "num_epochs": 10,
+        "batch_size": 32,
+        "learning_rate": 0.001,
+        "optimizer": "adam",
+        "lr_step_size": 5,
+        "lr_gamma": 0.1,
+        "early_stopping_patience": 3,
     }
-
-    # TODO: 初始化训练器
-    # trainer = ModelTrainer(PIPELINE_CONFIG, tracker)
-
-    # TODO: 运行训练
-    # model, best_val_acc = trainer.train(
-    #     train_loader=train_loader,
-    #     val_loader=val_loader,
-    #     num_classes=4,
-    #     params=params
-    # )
-
-    # TODO: 将指标推送到XCom
-    # context['task_instance'].xcom_push(key='best_val_acc', value=best_val_acc)
-
+    trainer = ModelTrainer(PIPELINE_CONFIG, tracker)
+    model, best_val_acc = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_classes=num_classes,
+        params=params,
+    )
+    context["task_instance"].xcom_push(
+        key="best_val_acc", value=float(best_val_acc)
+    )
     logger.info("Model training complete")
     return "Training successful"
 
 
 def evaluate_model(**context):
-    """
-    任务：在测试集上评估模型。
-
-    TODO：
-    1. 加载测试数据
-    2. 加载最佳模型
-    3. 初始化ModelEvaluator
-    4. 运行评估
-    5. 将测试指标推送到XCom
-    6. 返回成功消息
-    """
     logger.info("Starting model evaluation...")
+    import torch
 
-    # TODO: 导入所需的类
-    # from src.evaluation import ModelEvaluator
-    # import pandas as pd
-    # import torch
+    from src.dataset import create_data_loaders
+    from src.evaluation import ModelEvaluator
 
-    # TODO: 加载测试数据
-    # test_df = pd.read_csv(f"{PIPELINE_CONFIG['processed_data_path']}/test.csv")
+    all_splits_path = context["task_instance"].xcom_pull(
+        task_ids="preprocess_data", key="all_splits_csv"
+    )
+    if not all_splits_path:
+        raise ValueError("XCom missing all_splits_csv")
+    _, _, test_loader = create_data_loaders(
+        csv_path=all_splits_path,
+        root_dir=str(PROJECT_ROOT),
+        batch_size=32,
+    )
+    model_path = f"{PIPELINE_CONFIG['model_save_path']}/best_model.pth"
+    try:
+        model = torch.load(
+            model_path,
+            map_location=torch.device("cpu"),
+            weights_only=False,
+        )
+    except TypeError:
+        model = torch.load(model_path, map_location=torch.device("cpu"))
 
-    # TODO: 创建测试数据加载器
-    # test_loader = ...
-
-    # TODO: 加载最佳模型
-    # model_path = f"{PIPELINE_CONFIG['model_save_path']}/best_model.pth"
-    # model = torch.load(model_path)
-
-    # TODO: 初始化评估器
-    # class_names = ['cat', 'dog', 'bird', 'fish']
-    # evaluator = ModelEvaluator(PIPELINE_CONFIG, class_names)
-
-    # TODO: 运行评估
-    # metrics = evaluator.evaluate(model, test_loader)
-
-    # TODO: 将指标推送到XCom
-    # context['task_instance'].xcom_push(key='test_metrics', value=metrics)
-
+    class_names = [
+        "airplane",
+        "automobile",
+        "bird",
+        "cat",
+        "deer",
+        "dog",
+        "frog",
+        "horse",
+        "ship",
+        "truck",
+    ]
+    evaluator = ModelEvaluator(PIPELINE_CONFIG, class_names)
+    metrics = evaluator.evaluate(model, test_loader)
+    context["task_instance"].xcom_push(
+        key="test_metrics", value=_xcom_safe_metrics(metrics)
+    )
     logger.info("Model evaluation complete")
     return "Evaluation successful"
 
 
 def register_model(**context):
-    """
-    任务：如果模型满足条件，将其注册到MLflow模型注册表。
-
-    TODO：
-    1. 从XCom拉取测试指标
-    2. 检查模型是否满足生产标准（例如准确率 >= 85%）
-    3. 如果满足，在MLflow中注册模型
-    4. 过渡到Staging阶段
-    5. 返回注册结果
-    """
     logger.info("Starting model registration...")
+    import mlflow
 
-    # TODO: 拉取测试指标
-    # test_metrics = context['task_instance'].xcom_pull(
-    #     task_ids='evaluate_model',
-    #     key='test_metrics'
-    # )
+    test_metrics = context["task_instance"].xcom_pull(
+        task_ids="evaluate_model", key="test_metrics"
+    )
+    if not test_metrics:
+        raise ValueError("XCom missing test_metrics from evaluate_model")
 
-    # TODO: 检查生产标准
-    # accuracy_threshold = 0.85
-    # if test_metrics['test_accuracy'] >= accuracy_threshold:
-    #     # TODO: 导入MLflow
-    #     import mlflow
-    #
-    #     # TODO: 获取最新运行ID
-    #     experiment = mlflow.get_experiment_by_name(PIPELINE_CONFIG['experiment_name'])
-    #     runs = mlflow.search_runs(
-    #         experiment_ids=[experiment.experiment_id],
-    #         order_by=["start_time DESC"],
-    #         max_results=1
-    #     )
-    #     run_id = runs.iloc[0]['run_id']
-    #
-    #     # TODO: 注册模型
-    #     model_uri = f"runs:/{run_id}/model"
-    #     result = mlflow.register_model(
-    #         model_uri=model_uri,
-    #         name="image_classifier"
-    #     )
-    #
-    #     # TODO: 过渡到Staging
-    #     client = mlflow.tracking.MlflowClient()
-    #     client.transition_model_version_stage(
-    #         name="image_classifier",
-    #         version=result.version,
-    #         stage="Staging"
-    #     )
-    #
-    #     logger.info(f"Registered model version {result.version}")
-    #     return f"Model registered: version {result.version}"
-    # else:
-    #     logger.info(f"Model did not meet criteria (accuracy: {test_metrics['test_accuracy']:.2%})")
-    #     return "Model not registered - did not meet criteria"
+    accuracy_threshold = 0.85
+    acc = float(test_metrics.get("test_accuracy", 0.0))
+    if acc < accuracy_threshold:
+        logger.info(
+            "Model did not meet criteria (accuracy: %.2f%%)", acc * 100
+        )
+        return "Model not registered - did not meet criteria"
 
-    return "Model registration complete"
+    mlflow.set_tracking_uri(PIPELINE_CONFIG["mlflow_tracking_uri"])
+    experiment = mlflow.get_experiment_by_name(PIPELINE_CONFIG["experiment_name"])
+    if experiment is None:
+        raise ValueError(
+            f"MLflow 中不存在实验: {PIPELINE_CONFIG['experiment_name']!r}"
+        )
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if runs is None or runs.empty:
+        raise ValueError("未找到可注册的 MLflow run（search_runs 为空）")
+    run_id = runs.iloc[0]["run_id"]
+    model_uri = f"runs:/{run_id}/model"
+    result = mlflow.register_model(model_uri=model_uri, name="image_classifier")
+    client = mlflow.tracking.MlflowClient()
+    client.transition_model_version_stage(
+        name="image_classifier",
+        version=result.version,
+        stage="Staging",
+    )
+    logger.info("Registered model version %s", result.version)
+    return f"Model registered: version {result.version}"
+
+
+def notify_pipeline_success(**context):
+    """避免未配置 SMTP 时 EmailOperator 导致失败；需要邮件可改回 EmailOperator。"""
+    ds = context.get("ds")
+    uri = PIPELINE_CONFIG["mlflow_tracking_uri"]
+    logger.info("ML 管道已成功完成。ds=%s MLflow=%s", ds, uri)
+    return "notification logged"
 
 
 # ============================================================================
 # DAG定义
 # ============================================================================
 
-# TODO: 创建DAG
 dag = DAG(
-    dag_id='ml_training_pipeline',
+    dag_id="ml_training_pipeline",
     default_args=default_args,
-    description='End-to-end ML training pipeline with MLflow tracking',
-    # TODO: 设置调度（每周日午夜）
-    schedule_interval='@weekly',
+    description="End-to-end ML training pipeline with MLflow tracking",
+    schedule_interval="@weekly",
     start_date=days_ago(1),
-    catchup=False,  # 不为过去日期运行
-    max_active_runs=1,  # 同时只运行一个
-    tags=['ml', 'training', 'production'],
+    catchup=False,
+    max_active_runs=1,
+    tags=["ml", "training", "production"],
 )
 
-# TODO: 定义任务
 with dag:
-    # 任务1：摄取数据
     task_ingest = PythonOperator(
-        task_id='ingest_data',
+        task_id="ingest_data",
         python_callable=ingest_data,
-        # TODO: 如果使用Airflow < 2.0则添加provide_context=True
     )
-
-    # 任务2：验证数据
     task_validate = PythonOperator(
-        task_id='validate_data',
+        task_id="validate_data",
         python_callable=validate_data,
     )
-
-    # 任务3：预处理数据
     task_preprocess = PythonOperator(
-        task_id='preprocess_data',
+        task_id="preprocess_data",
         python_callable=preprocess_data,
     )
-
-    # 任务4：使用DVC版本化数据
     task_dvc = PythonOperator(
-        task_id='version_data_dvc',
+        task_id="version_data_dvc",
         python_callable=version_data_dvc,
     )
-
-    # 任务5：训练模型
+    task_store_features = PythonOperator(
+        task_id="store_features",
+        python_callable=store_features,
+    )
     task_train = PythonOperator(
-        task_id='train_model',
+        task_id="train_model",
         python_callable=train_model,
     )
-
-    # 任务6：评估模型
     task_evaluate = PythonOperator(
-        task_id='evaluate_model',
+        task_id="evaluate_model",
         python_callable=evaluate_model,
     )
-
-    # 任务7：注册模型
     task_register = PythonOperator(
-        task_id='register_model',
+        task_id="register_model",
         python_callable=register_model,
     )
-
-    # 任务8：发送成功邮件
-    task_notify = EmailOperator(
-        task_id='send_success_email',
-        to='mlops@example.com',  # TODO: 更新邮箱
-        subject='[成功] ML训练管道 - {{ ds }}',
-        html_content="""
-        <h3>ML训练管道成功完成</h3>
-        <p><strong>执行日期：</strong> {{ ds }}</p>
-        <p><strong>状态：</strong> 成功</p>
-        <p>在MLflow中查看结果：<a href="http://mlflow:5000">MLflow UI</a></p>
-        <p>查看管道：<a href="http://airflow:8080/dags/ml_training_pipeline/grid">Airflow DAG</a></p>
-        """,
+    task_notify = PythonOperator(
+        task_id="send_success_email",
+        python_callable=notify_pipeline_success,
     )
 
-    # TODO: 定义任务依赖关系
-    # 管道应按以下顺序流动：
-    # 摄取 → 验证 → 预处理 → 版本化 → 训练 → 评估 → 注册 → 通知
+    task_ingest >> task_validate >> task_preprocess >> task_dvc >> task_store_features
+    task_store_features >> task_train >> task_evaluate >> task_register >> task_notify
 
-    task_ingest >> task_validate >> task_preprocess >> task_dvc
-    task_dvc >> task_train >> task_evaluate >> task_register >> task_notify
-
-
-# ============================================================================
-# DAG测试（用于本地开发）
-# ============================================================================
 
 if __name__ == "__main__":
-    """
-    测试DAG结构而不运行任务。
-
-    TODO：
-    1. 打印DAG信息
-    2. 验证任务依赖关系
-    3. 检查循环
-    """
     print(f"DAG: {dag.dag_id}")
     print(f"Schedule: {dag.schedule_interval}")
+    print(f"PROJECT_ROOT: {PROJECT_ROOT}")
+    print(f"PIPELINE_CONFIG: {PIPELINE_CONFIG}")
     print(f"Tasks: {len(dag.tasks)}")
     print("\n任务依赖关系：")
     for task in dag.tasks:
-        print(f"  {task.task_id}: upstream={task.upstream_task_ids}, downstream={task.downstream_task_ids}")
+        print(
+            f"  {task.task_id}: upstream={task.upstream_task_ids}, downstream={task.downstream_task_ids}"
+        )

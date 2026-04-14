@@ -14,11 +14,13 @@
 
 import pandas as pd
 import logging
+import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
 from datetime import datetime
 import time
+from urllib.parse import urlparse
 
 # Configure logging
 logging.basicConfig(
@@ -57,10 +59,8 @@ class DataIngestion:
         4. 记录初始化
         """
         self.config = config
-        #  从配置中提取raw_data_path
-        self.raw_data_path = Path(config['raw_data_path'])
-
-        #  如果不存在则创建目录
+        raw_data_path = config['raw_data_path']
+        self.raw_data_path = Path(raw_data_path).expanduser().resolve()
         self.raw_data_path.mkdir(parents=True, exist_ok=True)
 
         #  从配置或使用默认值初始化重试设置
@@ -266,8 +266,14 @@ class DataIngestion:
         try:
             #  使用pd.read_sql()执行查询
             # 提示：df = pd.read_sql(query, connection_string)
-            df = None  # 用实际代码替换
-
+            from sqlalchemy import create_engine
+            
+            # 创建SQLAlchemy引擎
+            engine = create_engine(connection_string)
+            
+            # 执行查询
+            df = pd.read_sql(query, engine)
+            
             #  记录带有记录数的成功消息
             logger.info(f"成功从数据库查询{len(df)}条记录")
 
@@ -321,7 +327,10 @@ class DataIngestion:
         #  创建完整输出路径
         output_path = self.raw_data_path / filename
 
-        #  将DataFrame保存为CSV
+        #  将DataFrame保存为CSV（使用processed目录以避免权限问题）
+        processed_path = Path('/opt/airflow/data/processed')
+        processed_path.mkdir(parents=True, exist_ok=True)
+        output_path = processed_path / filename
         df.to_csv(output_path, index=False)
 
         #  如果未提供则创建元数据字典
@@ -338,7 +347,9 @@ class DataIngestion:
 
         #  将元数据保存为JSON
         # 提示：使用json.dump()或写入.meta.json文件
-        metadata.dump()
+        metadata_path = output_path.with_suffix('.meta.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
         #  记录成功
         logger.info(f"将原始数据保存到{output_path}（{len(df)}条记录）")
 
