@@ -5,8 +5,9 @@
 
 路径与 MLflow 地址通过环境变量配置，便于 conda 本地与 Docker 一致运行：
 - ML_PIPELINE_PROJECT_ROOT：项目根（可选；默认取本文件上级目录）
-- MLFLOW_TRACKING_URI：默认 http://127.0.0.1:5000（conda）；Docker 可设为 http://mlflow:5000
-- FEATURE_STORE_POSTGRES_*：特征库连接（默认与 docker-compose 中 Postgres/mlflow 一致）
+- MLFLOW_TRACKING_URI：宿主机默认 http://127.0.0.1:5000；Docker 内未设置时默认 http://mlflow:5000
+- FEATURE_STORE_POSTGRES_*：特征库连接。未设置主机时：在 Docker 容器内（存在 /.dockerenv）默认用
+  服务名 postgres；在宿主机上默认 127.0.0.1（本机 conda + 本机 Postgres）
 """
 
 from __future__ import annotations
@@ -37,6 +38,14 @@ if _root_str not in sys.path:
 logger = logging.getLogger(__name__)
 
 
+def _default_mlflow_tracking_uri() -> str:
+    if os.environ.get("MLFLOW_TRACKING_URI"):
+        return os.environ["MLFLOW_TRACKING_URI"]
+    if Path("/.dockerenv").is_file():
+        return "http://mlflow:5000"
+    return "http://127.0.0.1:5000"
+
+
 def _build_pipeline_config() -> dict:
     root = PROJECT_ROOT
     return {
@@ -44,9 +53,7 @@ def _build_pipeline_config() -> dict:
         "processed_data_path": str(root / "data" / "processed"),
         "model_save_path": str(root / "models"),
         "artifacts_path": str(root / "artifacts"),
-        "mlflow_tracking_uri": os.environ.get(
-            "MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"
-        ),
+        "mlflow_tracking_uri": _default_mlflow_tracking_uri(),
         "experiment_name": os.environ.get(
             "MLFLOW_EXPERIMENT_NAME", "image_classification_pipeline"
         ),
@@ -54,6 +61,49 @@ def _build_pipeline_config() -> dict:
 
 
 PIPELINE_CONFIG = _build_pipeline_config()
+
+
+def _feature_store_postgres_host() -> str:
+    """
+    Postgres 主机：显式环境变量优先；否则在 Docker 内默认连 compose 服务名 postgres，
+    避免任务进程里 localhost 指向容器自身导致 Connection refused。
+    """
+    explicit = os.environ.get("FEATURE_STORE_POSTGRES_HOST") or os.environ.get(
+        "POSTGRES_HOST"
+    )
+    if explicit:
+        return explicit
+    if Path("/.dockerenv").is_file():
+        logger.info(
+            "FEATURE_STORE_POSTGRES_HOST 未设置，检测到 Docker 环境，使用主机名 postgres"
+        )
+        return "postgres"
+    return "127.0.0.1"
+
+
+def _get_all_splits_csv_path(context: dict) -> str:
+    """
+    从 preprocess_data 的 XCom 读取 all_splits_csv；若缺失则回退到磁盘路径。
+
+    缺失常见原因：DAG 代码升级后只重试了下游任务，上游已成功实例仍只有旧版 XCom
+    （例如仅有 preprocessing_complete）。回退路径与 preprocess 写入位置一致。
+    """
+    ti = context["task_instance"]
+    path = ti.xcom_pull(task_ids="preprocess_data", key="all_splits_csv")
+    if path:
+        return path
+    fallback = Path(PIPELINE_CONFIG["processed_data_path"]) / "all_splits.csv"
+    if fallback.is_file():
+        resolved = str(fallback.resolve())
+        logger.warning(
+            "XCom 中无 all_splits_csv（常见于仅重试下游或旧运行）；使用文件: %s",
+            resolved,
+        )
+        return resolved
+    raise ValueError(
+        "无法得到 all_splits.csv：请重新运行 preprocess_data，或确认文件存在: "
+        f"{fallback}"
+    )
 
 
 def _xcom_safe_metrics(metrics: dict) -> dict:
@@ -210,19 +260,12 @@ def store_features(**context):
 
     from src.feature_store import FeatureStore
 
-    all_splits_path = context["task_instance"].xcom_pull(
-        task_ids="preprocess_data", key="all_splits_csv"
-    )
-    if not all_splits_path:
-        raise ValueError("XCom missing all_splits_csv from preprocess_data")
+    all_splits_path = _get_all_splits_csv_path(context)
     df = pd.read_csv(all_splits_path)
     train_df = df[df["split"] == "train"]
     label_col = "label_encoded" if "label_encoded" in train_df.columns else "label"
 
-    host = os.environ.get(
-        "FEATURE_STORE_POSTGRES_HOST",
-        os.environ.get("POSTGRES_HOST", "localhost"),
-    )
+    host = _feature_store_postgres_host()
     port = int(os.environ.get("FEATURE_STORE_POSTGRES_PORT", "5432"))
     database = os.environ.get("FEATURE_STORE_POSTGRES_DB", "mlflow")
     user = os.environ.get("FEATURE_STORE_POSTGRES_USER", "mlflow")
@@ -253,11 +296,7 @@ def train_model(**context):
     from src.dataset import create_data_loaders
     from src.training import MLflowTracker, ModelTrainer
 
-    all_splits_path = context["task_instance"].xcom_pull(
-        task_ids="preprocess_data", key="all_splits_csv"
-    )
-    if not all_splits_path:
-        raise ValueError("XCom missing all_splits_csv")
+    all_splits_path = _get_all_splits_csv_path(context)
     root_dir = str(PROJECT_ROOT)
     train_loader, val_loader, _ = create_data_loaders(
         csv_path=all_splits_path,
@@ -302,11 +341,7 @@ def evaluate_model(**context):
     from src.dataset import create_data_loaders
     from src.evaluation import ModelEvaluator
 
-    all_splits_path = context["task_instance"].xcom_pull(
-        task_ids="preprocess_data", key="all_splits_csv"
-    )
-    if not all_splits_path:
-        raise ValueError("XCom missing all_splits_csv")
+    all_splits_path = _get_all_splits_csv_path(context)
     _, _, test_loader = create_data_loaders(
         csv_path=all_splits_path,
         root_dir=str(PROJECT_ROOT),

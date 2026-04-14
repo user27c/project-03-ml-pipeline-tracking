@@ -1,0 +1,15 @@
+{
+    "split": "train",
+    "record_count": 35000,
+    "columns": [
+        "image_path",
+        "label",
+        "split",
+        "label_encoded"
+    ],
+    "shape": [
+        4,
+        35000
+    ],
+    "created_at": "2026-04-14T01:26:26.220706"
+}

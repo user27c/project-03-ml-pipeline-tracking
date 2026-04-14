@@ -8,6 +8,9 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir psycopg2-binary pandas scikit-learn matplotlib seaborn
 
+# 训练/评估任务依赖（src/training.py、src/evaluation.py）
+RUN pip install --no-cache-dir mlflow
+
 # 安装 PyTorch（使用清华镜像）
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 

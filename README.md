@@ -1,478 +1,179 @@
-# 项目03：带实验跟踪的ML管道
+# 带实验跟踪的 ML 管道（MLOps 练习项目）
 
-**角色：** 初级AI基础设施工程师（0级）
-**时长：** 100小时（全职2-3周，兼职4-5周）
-**复杂度：** 中级
-**先决条件：** 项目1-2（API部署、Kubernetes服务）
+面向**项目维护者与实现者**：说明本仓库实现什么、代码如何组织、如何在本机或 Docker 中跑通，以及常见配置项。课程级背景与评分细则见 [`requirements.md`](requirements.md)；设计细节见 [`architecture.md`](architecture.md)。
 
-***
+---
 
-## 项目概述
+## 1. 项目定位
 
-构建端到端的机器学习管道，具有自动实验跟踪、数据版本控制、模型注册和工作流编排。本项目介绍了MLOps基础知识：从数据摄取到模型部署的完整ML生命周期管理。
+本仓库实现一条 **从数据摄取 → 校验 → 预处理 →（可选 DVC）→ 特征入库 → 训练 → 评估 → 模型注册** 的流水线，并用 **Apache Airflow** 编排、**MLflow** 做实验与模型跟踪、**PostgreSQL** 存特征与元数据、**DVC + MinIO** 支撑数据与工件版本化（按你的环境启用程度而定）。
 
-### 你将构建的内容
+解决的问题可以概括成：实验可复现、数据与模型可追溯、重复训练可自动化。
 
-在本项目中，你将构建一个生产级的ML管道，该管道：
+---
 
-- **自动化整个ML工作流**，从原始数据到已部署的模型
-- **跟踪每个实验**，使用MLflow实现完全可复现性
-- **版本化所有数据和模型**，使用DVC（数据版本控制）
-- **编排复杂工作流**，使用Apache Airflow
-- **验证数据质量**，使用Great Expectations
-- **管理模型生命周期**，通过MLflow模型注册
-- **提供实验分析**，通过交互式仪表板
+## 2. 演示截图（预留）
 
-### 真实场景
+请将演示图片放在仓库根目录下的 **`result_img/`** 中，并在下方替换文件名或取消注释。建议命名便于区分场景。
 
-成功部署模型（项目1-2）后，数据科学团队面临新的挑战：管理数十个实验、跟踪哪些数据集版本产生最佳模型、自动化重新训练工作流。如果没有适当的MLOps基础设施，团队会遇到：
+| 场景 | 建议文件名 | 说明 |
+|------|------------|------|
+| 端到端架构或数据流 | `result_img/demo_architecture.png` | 可手绘或从 `architecture.md` 导出 |
+| Airflow DAG / 运行实例 | `result_img/demo_airflow_dag.png` | Grid / Graph / 一次成功 Run |
+| MLflow 实验与指标 | `result_img/demo_mlflow_ui.png` | Runs / Metrics / Artifacts |
+| MLflow 模型注册（可选） | `result_img/demo_model_registry.png` | Registered Models |
+| MinIO 桶与工件（可选） | `result_img/demo_minio.png` | `mlflow` 桶或 DVC 远程 |
+| 评估曲线或混淆矩阵（可选） | `result_img/demo_evaluation.png` | 来自 `evaluation` 产出 |
 
-- **实验丢失** - "哪些超参数产生了那个92%准确率的模型？"
-- **数据不一致** - "我们是在数据集1.2版还是1.3版上训练的？"
-- **手动流程** - "需要每周重新训练模型"
-- **无法复现** - "我无法重现上个月的结果"
+**占位图（放入同名文件后即显示）：**
 
-本项目模拟构建内部ML平台能力，以大规模解决这些问题。
+<p align="center">
 
-### 学习目标
+<!-- 将 demo_architecture.png 放入 result_img/ -->
+<img src="result_img/demo_architecture.png" alt="架构 / 数据流演示（请将图片放到 result_img/demo_architecture.png）" width="720"/>
 
-通过完成本项目，你将：
+</p>
 
-1. **设计和实现ML管道**，使用工作流编排工具（Airflow）
-2. **系统地跟踪实验**，使用MLflow（指标、参数、工件）
-3. **版本化数据集和模型**，使用DVC（数据版本控制）
-4. **构建模型注册**，用于模型生命周期管理
-5. **自动化模型重新训练**，使用计划管道
-6. **创建比较仪表板**，用于实验分析
-7. **实现数据验证**和管道监控
-8. **应用MLOps最佳实践**，实现可复现性和治理
+<p align="center">
 
-***
+<!-- 将 demo_airflow_dag.png 放入 result_img/ -->
+<img src="result_img/demo_airflow_dag.png" alt="Airflow DAG 演示（请将图片放到 result_img/demo_airflow_dag.png）" width="720"/>
 
-## 技术栈
+</p>
 
-### 核心技术
+<p align="center">
 
-| 组件         | 技术                       | 用途            |
-| ---------- | ------------------------ | ------------- |
-| **编排**     | Apache Airflow 2.7+      | 工作流管理和调度      |
-| **实验跟踪**   | MLflow 2.8+              | 跟踪运行、模型、工件    |
-| **数据版本控制** | DVC 3.30+                | 数据集版本控制       |
-| **数据验证**   | Great Expectations 0.18+ | 数据质量检查        |
-| **ML框架**   | PyTorch 2.0+             | 模型训练          |
-| **数据库**    | PostgreSQL 15+           | MLflow后端、特征存储 |
-| **对象存储**   | MinIO（本地）                | 工件存储          |
-| **消息队列**   | Redis 7+                 | Airflow任务队列   |
+<!-- 将 demo_mlflow_ui.png 放入 result_img/ -->
+<img src="result_img/demo_mlflow_ui.png" alt="MLflow 演示（请将图片放到 result_img/demo_mlflow_ui.png）" width="720"/>
 
-### 为什么选择这些技术？
+</p>
 
-- **Apache Airflow**：工作流编排的行业标准（由Airbnb、Netflix、Adobe使用）
-- **MLflow**：最受欢迎的开源MLOps平台，拥有15K+ GitHub星标
-- **DVC**：数据和模型的Git-like版本控制，与现有工作流程无缝集成
-- **Great Expectations**：通过自动化验证防止不良数据进入管道
-- **PostgreSQL**：用于元数据和特征的可靠、可扩展数据库
-- **MinIO**：用于本地开发的S3兼容对象存储
+> **说明：** 在图片尚未加入前，部分 Markdown 预览器会显示裂图，属正常现象；补齐 `result_img/` 内文件即可。
 
-***
+---
 
-## 系统架构
+## 3. 技术栈（实现侧）
+
+| 领域 | 选型 | 在本项目中的角色 |
+|------|------|------------------|
+| 编排 | Apache Airflow 2.7+ | `dags/ml_pipeline_dag.py` 定义任务依赖与调度 |
+| 实验与模型 | MLflow | `src/training.py` 等写入 Run；注册在 DAG `register_model` |
+| 训练 / 评估 | PyTorch | `src/training.py`、`src/evaluation.py`、`src/dataset.py` |
+| 数据校验 | 自研 `DataValidator`（类 Great Expectations 规则） | `src/data_validation.py` |
+| 特征表 | PostgreSQL + `psycopg2` | `src/feature_store.py` |
+| 数据版本 | DVC（可选） | 任务 `version_data_dvc`；需本机/容器内 Git + DVC |
+| 对象存储 | MinIO（Compose 中） | MLflow artifact、可与 DVC 远程对接 |
+| 消息队列 | Redis | Airflow Celery Executor（`docker-compose.yml`） |
+
+---
+
+## 4. 架构概览（实现视角）
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    ML管道架构                               │
-└─────────────────────────────────────────────────────────────┘
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  数据        │     │  PostgreSQL  │     │  MinIO/S3    │
-│  源          │────▶│  特征        │     │  工件        │
-│  (CSV/API)   │     │  存储        │     │  存储        │
-└──────────────┘     └──────────────┘     └──────────────┘
-       │                     │                     │
-       │                     │                     │
-       ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Airflow/Prefect                          │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  DAG：ML训练管道                                      │   │
-│  │                                                       │   │
-│  │  [数据摄取] → [数据验证] → [预处理]                   │   │
-│  │         │                                             │   │
-│  │         ▼                                             │   │
-│  │  [特征工程] → [训练模型] → [评估]                     │   │
-│  │         │                      │              │       │   │
-│  │         ▼                      ▼              ▼       │   │
-│  │  [DVC提交]         [MLflow跟踪]  [模型注册]           │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-                   ┌────────────────┐
-                   │  MLflow        │
-                   │  - 跟踪        │
-                   │  - 注册        │
-                   │  - UI          │
-                   └────────────────┘
+数据源 (CSV，如 CIFAR-10 列表)
+    → 摄取 / 校验 / 预处理 (src/*)
+    → 合并划分 all_splits.csv → 训练与评估 (dataset + training + evaluation)
+    → MLflow 记录；达标则模型注册
+    → 特征写入 PostgreSQL（FeatureStore）
 ```
 
-### 数据流
+Airflow 仅负责**调度与传参**（含 XCom）；业务逻辑集中在 `src/`。DAG 内通过 **`PROJECT_ROOT` / 环境变量** 区分「本机 conda」与「Docker `/opt/airflow`」，避免写死个人路径。
 
-```
-原始数据 (CSV/API)
-       │
-       ▼
-数据验证 (Great Expectations)
-       │
-       ▼
-预处理 (清洗、转换)
-       │
-       ▼
-特征存储 (PostgreSQL) ◄──── DVC (版本控制)
-       │
-       ▼
-模型训练 (PyTorch) ◄──── MLflow (跟踪)
-       │
-       ▼
-模型评估 (指标)
-       │
-       ▼
-模型注册 (版本化) ◄──── MLflow注册
-```
+---
 
-***
-
-## 项目结构
+## 5. 仓库结构（与代码对应）
 
 ```
 project-03-ml-pipeline-tracking/
-├── README.md                           # 本文件
-├── requirements.md                     # 详细要求
-├── architecture.md                     # 架构深入分析
-├── docker-compose.yml                  # 多服务编排
-├── .env.example                        # 环境配置
-├── src/
-│   ├── data_ingestion.py              # 数据摄取模块（STUB）
-│   ├── preprocessing.py               # 数据预处理（STUB）
-│   ├── training.py                    # 带MLflow的模型训练（STUB）
-│   └── evaluation.py                  # 模型评估（STUB）
+├── README.md                 # 本文件（开发者说明）
+├── requirements.md           # 课程 / 需求细则
+├── architecture.md           # 架构与设计决策（偏长文）
+├── docker-compose.yml        # Postgres、MinIO、MLflow、Redis、Airflow 等
 ├── dags/
-│   └── ml_pipeline_dag.py             # Airflow DAG（STUB）
+│   └── ml_pipeline_dag.py    # 主 DAG：任务与 XCom、环境变量约定
+├── src/
+│   ├── data_ingestion.py     # 摄取与落盘
+│   ├── data_validation.py    # 数据质量校验
+│   ├── preprocessing.py      # 清洗、编码、划分、all_splits.csv
+│   ├── feature_store.py      # PostgreSQL 特征表
+│   ├── dataset.py            # PyTorch Dataset / DataLoader
+│   ├── training.py           # 训练 + MLflow
+│   └── evaluation.py         # 评估指标与图表
+├── airflow/
+│   ├── Dockerfile            # Airflow 镜像：需包含 mlflow、torch 等
+│   └── requirements.txt      # 与镜像安装对齐的依赖列表（参考）
 ├── mlflow/
-│   └── MLproject                      # MLflow项目配置
-├── dvc/
-│   ├── data.dvc                       # DVC数据版本控制
-│   └── .dvcignore                     # DVC忽略模式
+│   ├── Dockerfile
+│   └── MLproject
+├── scripts/                  # SQL 初始化、数据准备等
 ├── tests/
-│   └── test_pipeline.py               # 管道测试（STUB）
-└── docs/
-    ├── SETUP.md                        # 设置说明
-    ├── MLFLOW_GUIDE.md                 # MLflow使用指南
-    └── DVC_WORKFLOW.md                 # DVC工作流指南
+│   └── test_pipeline.py
+├── data/                     # raw / processed / validation（运行时产出，勿乱提交大文件）
+└── result_img/               # 演示截图（你可自行添加，见上文「演示截图」）
 ```
 
-***
+---
 
-## 入门指南
+## 6. 主 DAG 任务链（开发者速查）
 
-### 先决条件
+任务顺序：**ingest → validate → preprocess → version_data_dvc → store_features → train → evaluate → register → notify**。
 
-开始本项目前，请确保你已具备：
+维护 DAG 时重点关注：
 
-- 完成项目1和项目2（API部署、Kubernetes基础知识）
-- 已安装Docker和Docker Compose
-- 已安装Python 3.11+
-- 已安装Git
-- 基本了解：
-  - 机器学习概念（训练、验证、测试）
-  - SQL和数据库
-  - 工作流自动化概念
+- **路径**：统一由 `PROJECT_ROOT` 与 `PIPELINE_CONFIG` 推导；Docker 下常设 `ML_PIPELINE_PROJECT_ROOT=/opt/airflow`。
+- **XCom**：下游依赖 `preprocess_data` 写入的 `all_splits_csv`（或回退到磁盘上的 `data/processed/all_splits.csv`）。
+- **PostgreSQL**：容器内不要用 `localhost` 指代「宿主机上的库」；同 Compose 网络内应使用服务名 **`postgres`**（DAG 中已对 Docker 做了默认检测，仍可通过环境变量覆盖）。
+- **MLflow URI**：容器内默认 `http://mlflow:5000`；本机 conda 常用 `http://127.0.0.1:5000`。
 
-### 快速开始
+常用环境变量（可选，按部署填写）：
 
-1. **导航到项目目录：**
-   ```bash
-   cd projects/project-03-ml-pipeline-tracking/
-   ```
-2. **设置环境：**
-   ```bash
-   cp .env.example .env
-   # 使用你的配置编辑.env
-   ```
-3. **安装依赖：**
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. **使用Docker Compose启动基础设施：**
-   ```bash
-   docker-compose up -d
-   ```
-5. **验证服务：**
-   - MLflow UI: <http://localhost:5000>
-   - Airflow UI: <http://localhost:8080>
-   - MinIO控制台: <http://localhost:9001>
-6. **阅读详细要求：**
-   ```bash
-   cat requirements.md
-   ```
-7. **遵循architecture.md中的实现指南**
+| 变量 | 含义 |
+|------|------|
+| `ML_PIPELINE_PROJECT_ROOT` | 项目根绝对路径（Docker 常为 `/opt/airflow`） |
+| `MLFLOW_TRACKING_URI` | MLflow 跟踪地址 |
+| `FEATURE_STORE_POSTGRES_HOST` / `FEATURE_STORE_POSTGRES_*` | 特征库连接 |
+| `ML_PIPELINE_ALERT_EMAIL` | 若设置，则启用失败邮件相关默认行为（视 Airflow SMTP 配置而定） |
 
-***
+---
 
-## 学习路径
+## 7. 运行方式
 
-### 阶段1：环境设置（15小时）
+### 7.1 Docker Compose（推荐对齐课堂/集成环境）
 
-- 设置Docker Compose基础设施
-- 配置MLflow跟踪服务器
-- 初始化DVC用于数据版本控制
-- 安装所有依赖
+1. 启动栈：`docker compose up -d`（或 `docker-compose`，视版本而定）。
+2. 按 `docker-compose.yml` 文末注释完成 **Airflow DB 初始化、管理员用户、MinIO `mlflow` 桶** 等一次性步骤。
+3. 重新构建 Airflow 镜像以纳入代码与依赖变更：`docker compose build --no-cache` 后再 `up`。
+4. 浏览器：**Airflow** 常为 `http://localhost:8080`，**MLflow** `http://localhost:5000`。
 
-**交付物：** 所有服务运行并可访问
+### 7.2 本机 Conda / venv + Airflow
 
-### 阶段2：数据管道（25小时）
+- 在**运行 scheduler / worker 的同一环境**中安装与 `airflow/requirements.txt` 相当的依赖（至少包含 **mlflow、torch、psycopg2-binary** 及项目 `src` 所需包）。
+- 将本仓库根目录加入 `PYTHONPATH`，或将 `dags/`、`src/` 放到 Airflow 配置的 `dags_folder` 与可导入路径下。
+- 未设置 `ML_PIPELINE_PROJECT_ROOT` 时，DAG 以 **`dags/ml_pipeline_dag.py` 所在仓库根** 推导项目根，请保持目录结构不变。
 
-- 从多个源实现数据摄取
-- 使用Great Expectations添加数据验证
-- 构建预处理管道
-- 使用DVC版本化数据
+---
 
-**交付物：** 具有验证的完整数据管道
+## 8. 文档与扩展阅读
 
-### 阶段3：MLflow集成（20小时）
+- [`requirements.md`](requirements.md)：功能清单与学习目标（课程向）。
+- [`architecture.md`](architecture.md)：组件、数据流、技术决策。
+- 上游官方文档：[MLflow](https://mlflow.org/docs/latest/index.html)、[Airflow](https://airflow.apache.org/docs/)、[DVC](https://dvc.org/doc)。
 
-- 设置MLflow实验跟踪
-- 实现带跟踪的模型训练
-- 记录参数、指标和工件
-- 构建模型注册
+---
 
-**交付物：** MLflow中多个跟踪的实验
+## 9. 常见问题（维护者向）
 
-### 阶段4：工作流编排（30小时）
+| 现象 | 可能原因 | 处理方向 |
+|------|----------|----------|
+| `ModuleNotFoundError: mlflow` | Airflow 运行环境未安装 mlflow | 在 **Airflow 同一环境** `pip install mlflow`，或重建 **airflow/Dockerfile** 镜像 |
+| Postgres `Connection refused` + `localhost` | 任务跑在容器内，却连本机 `localhost` | 使用服务名 `postgres` 或设置 `FEATURE_STORE_POSTGRES_HOST` |
+| XCom 缺少 `all_splits_csv` | 仅重试了下游，上游仍是旧 XCom | Clear 上游 `preprocess_data` 或全量重跑；DAG 已支持回退到 `all_splits.csv` 文件 |
+| DVC 任务失败 | 容器内无 `.git`/`.dvc` 或未配置远程 | 仅开发环境可跳过该任务或挂载仓库根 |
 
-- 设计Airflow DAG结构
-- 实现管道任务
-- 配置调度和错误处理
-- 测试端到端管道
+---
 
-**交付物：** 按计划运行的自动化管道
+## 10. 版本信息
 
-### 阶段5：分析和文档（10小时）
-
-- 创建实验比较笔记本
-- 编写综合文档
-- 构建实验分析仪表板
-- 准备演示材料
-
-**交付物：** 完整的文档和分析工具
-
-***
-
-## 关键概念
-
-### MLOps基础知识
-
-**什么是MLOps？**
-MLOps（机器学习运维）将DevOps原则应用于ML工作流，确保模型：
-
-- **可复现** - 相同的代码和数据产生相同的结果
-- **自动化** - 消除手动步骤
-- **可监控** - 持续跟踪性能
-- **版本化** - 所有工件都进行版本控制
-
-**为什么MLOps很重要：**
-
-- **开发速度**：使用自动跟踪，实验速度提高10倍
-- **协作**：团队可以共享实验并重现结果
-- **生产就绪**：模型从研究到生产的平滑过渡
-- **治理**：所有实验的完整审计跟踪
-
-### 实验跟踪
-
-**跟踪内容：**
-
-- **参数**：超参数（学习率、批大小、模型架构）
-- **指标**：性能指标（准确率、损失、F1分数）
-- **工件**：模型文件、图表、数据集、日志
-- **代码版本**：Git提交哈希以实现可复现性
-- **环境**：依赖和硬件规格
-
-**优势：**
-
-- 永不丢失好的实验
-- 系统地比较模型
-- 与团队成员共享结果
-- 数月后重现结果
-
-### 数据版本控制
-
-**为什么版本化数据：**
-
-- 数据随时间变化
-- 需要重现旧实验
-- 跟踪数据血统
-- 协作处理数据集
-
-**DVC工作流：**
-
-```bash
-# 跟踪数据集
-dvc add data/raw/dataset.csv
-
-# 提交到Git
-git add data/raw/dataset.csv.dvc
-git commit -m "添加数据集版本1.0"
-
-# 推送到远程存储
-dvc push
-
-# 稍后：检索确切的数据集
-dvc pull
-```
-
-### 工作流编排
-
-**为什么使用Airflow：**
-
-- **依赖**：任务按正确顺序运行
-- **调度**：自动执行（每日、每周）
-- **监控**：跟踪任务成功/失败
-- **重试**：失败时自动重试
-- **可扩展性**：跨工作器分发任务
-
-**DAG（有向无环图）：**
-
-```python
-# 定义任务依赖
-ingest_data >> validate_data >> preprocess_data
-preprocess_data >> train_model >> evaluate_model
-evaluate_model >> register_model
-```
-
-***
-
-## 成功标准
-
-### 最低要求
-
-- [ ] 所有基础设施服务运行（MLflow、Airflow、PostgreSQL、MinIO）
-- [ ] 数据管道摄取、验证和预处理数据
-- [ ] 至少5个实验在MLflow中跟踪
-- [ ] 模型记录有完整元数据（参数、指标、工件）
-- [ ] Airflow DAG端到端成功运行
-- [ ] 数据使用DVC版本化
-- [ ] 模型注册包含多个版本
-- [ ] 管道计划并自动运行
-- [ ] 文档完整清晰
-
-### 优秀标准
-
-- [ ] 10+实验，系统超参数搜索
-- [ ] 使用Great Expectations的全面数据验证
-- [ ] 高级实验分析笔记本
-- [ ] 自定义MLflow可视化
-- [ ] 管道监控和警报
-- [ ] 生产就绪的错误处理
-- [ ] 完整的测试覆盖率
-- [ ] 带图表的专业文档
-
-***
-
-## 常见挑战和解决方案
-
-### 挑战1：服务依赖
-
-**问题：** Airflow在PostgreSQL准备就绪前尝试连接
-**解决方案：** 使用Docker健康检查和带条件的`depends_on`
-
-### 挑战2：实验混乱
-
-**问题：** 实验太多，难以找到相关实验
-**解决方案：** 使用有意义的标签和命名约定
-
-### 挑战3：数据太大
-
-**问题：** Git无法处理大型数据集
-**解决方案：** 始终对数据使用DVC，不要将数据提交到Git
-
-### 挑战4：MLflow工件未保存
-
-**问题：** 工件在运行后消失
-**解决方案：** 验证工件存储配置（S3/MinIO端点）
-
-### 挑战5：Airflow DAG未更新
-
-**问题：** 代码更改未出现在Airflow UI中
-**解决方案：** 检查DAG文件夹挂载和Airflow刷新间隔
-
-***
-
-## 资源
-
-### 官方文档
-- [MLflow文档](https://mlflow.org/docs/latest/index.html)
-- [Apache Airflow文档](https://airflow.apache.org/docs/)
-- [DVC文档](https://dvc.org/doc)
-- [Great Expectations文档](https://docs.greatexpectations.io/)
-
-### 教程
-- [MLflow快速入门](https://mlflow.org/docs/latest/tutorials-and-examples/tutorial.html)
-- [Airflow教程](https://airflow.apache.org/docs/apache-airflow/stable/tutorial.html)
-- [DVC入门](https://dvc.org/doc/start)
-
-### 社区
-- [MLflow Discord](https://mlflow.org/community)
-- [Airflow Slack](https://apache-airflow-slack.herokuapp.com/)
-- [DVC社区](https://dvc.org/community)
-
-***
-
-## 下一步
-
-完成本项目后：
-
-1. **进入项目4**：监控和警报系统
-2. **扩展本项目**，添加：
-   - 模型漂移检测
-   - A/B测试框架
-   - 特征存储（Feast）
-   - AutoML集成
-3. **作品集**：用演示视频将此添加到你的作品集
-4. **博客**：撰写关于构建生产ML管道的文章
-5. **面试准备**：在面试中讨论MLOps架构
-
-***
-
-## 评估
-
-你的工作将根据以下标准进行评估：
-
-- **功能（40%）**：管道是否端到端工作？
-- **MLOps实践（30%）**：适当的跟踪、版本控制、自动化？
-- **代码质量（15%）**：干净、组织良好的代码？
-- **文档（15%）**：清晰、全面的文档？
-
-**通过分数：** 70/100
-**优秀目标：** 85/100
-
-***
-
-## 支持
-
-### 获取帮助
-
-1. **检查文档** 在`docs/`文件夹中
-2. **查看代码stub** 了解TODO注释和指导
-3. **搜索问题** 在项目仓库中
-4. **提问** 在社区论坛中
-5. **仔细阅读错误日志** - 它们通常指向解决方案
-
-### 常见错误消息
-
-请参阅`docs/TROUBLESHOOTING.md`以获取常见问题的解决方案。
-
-***
-
-**项目版本：** 1.0
-**最后更新：** 2025年10月18日
-**维护者：** AI基础设施课程团队
-
-**准备开始？** 打开`requirements.md`获取详细规范！
+- **文档面向：** 项目开发者 / 维护者  
+- **详细需求与评分：** 见 `requirements.md`  
+- **演示素材目录：** `result_img/`（当前可用 `.gitkeep` 占位目录；图片请自行添加）
