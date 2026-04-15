@@ -16,8 +16,8 @@ COPY data/ ./data/
 COPY models/ ./models/
 COPY artifacts/ ./artifacts/
 
-# 安装项目依赖
-RUN pip install --no-cache-dir mlflow psycopg2-binary scikit-learn matplotlib seaborn pandas numpy torch torchvision
+# 安装项目依赖（S3/MinIO 需要 boto3/botocore 才能列出/读取 artifacts）
+RUN pip install --no-cache-dir mlflow boto3 psycopg2-binary scikit-learn matplotlib seaborn pandas numpy torch torchvision
 
 # 暴露端口
 EXPOSE 5000

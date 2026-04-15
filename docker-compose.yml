@@ -68,6 +68,11 @@ services:
       MLFLOW_SERVER_ALLOWED_HOSTS: mlflow,localhost,127.0.0.1
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
+      # MinIO 需 path-style，否则 MLflow UI 常出现「已上传但 Artifacts 列表为空」
+      AWS_S3_ADDRESSING_STYLE: path
+      # boto3 在部分环境下需要 region 才能正确生成/解析请求（否则 UI 取 artifact 可能 500）
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,6 +113,7 @@ services:
     build:
       context: .
       dockerfile: ./airflow/Dockerfile
+    image: ml-pipeline-airflow:local
     container_name: ml_pipeline_airflow_webserver
     ports:
       - "8080:8080"
@@ -126,6 +132,19 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_ADDRESSING_STYLE: path
+      MAIL_SMTP_HOST: smtp.qq.com
+      MAIL_SMTP_PORT: "465"
+      MAIL_SMTP_MODE: ${MAIL_SMTP_MODE:-auto}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      ML_PIPELINE_ALERT_EMAIL: ${ML_PIPELINE_ALERT_EMAIL:-}
+      ML_PIPELINE_REUSE_TRAIN_CACHE: ${ML_PIPELINE_REUSE_TRAIN_CACHE:-false}
+      ML_PIPELINE_TRAIN_SAMPLE_RATIO: ${ML_PIPELINE_TRAIN_SAMPLE_RATIO:-0.2}
+      ML_PIPELINE_MODEL_NAME: ${ML_PIPELINE_MODEL_NAME:-mobilenet_v2}
+      ML_PIPELINE_NUM_EPOCHS: ${ML_PIPELINE_NUM_EPOCHS:-2}
+      ML_PIPELINE_BATCH_SIZE: ${ML_PIPELINE_BATCH_SIZE:-64}
+      ML_PIPELINE_EARLY_STOPPING_PATIENCE: ${ML_PIPELINE_EARLY_STOPPING_PATIENCE:-1}
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow
@@ -151,9 +170,7 @@ services:
   # Schedules and triggers DAG runs
   # ============================================================================
   airflow-scheduler:
-    build:
-      context: .
-      dockerfile: ./airflow/Dockerfile
+    image: ml-pipeline-airflow:local
     container_name: ml_pipeline_airflow_scheduler
     environment:
       AIRFLOW__CORE__EXECUTOR: CeleryExecutor
@@ -169,6 +186,19 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_ADDRESSING_STYLE: path
+      MAIL_SMTP_HOST: smtp.qq.com
+      MAIL_SMTP_PORT: "465"
+      MAIL_SMTP_MODE: ${MAIL_SMTP_MODE:-auto}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      ML_PIPELINE_ALERT_EMAIL: ${ML_PIPELINE_ALERT_EMAIL:-}
+      ML_PIPELINE_REUSE_TRAIN_CACHE: ${ML_PIPELINE_REUSE_TRAIN_CACHE:-false}
+      ML_PIPELINE_TRAIN_SAMPLE_RATIO: ${ML_PIPELINE_TRAIN_SAMPLE_RATIO:-0.2}
+      ML_PIPELINE_MODEL_NAME: ${ML_PIPELINE_MODEL_NAME:-mobilenet_v2}
+      ML_PIPELINE_NUM_EPOCHS: ${ML_PIPELINE_NUM_EPOCHS:-2}
+      ML_PIPELINE_BATCH_SIZE: ${ML_PIPELINE_BATCH_SIZE:-64}
+      ML_PIPELINE_EARLY_STOPPING_PATIENCE: ${ML_PIPELINE_EARLY_STOPPING_PATIENCE:-1}
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow
@@ -194,9 +224,7 @@ services:
   # Executes tasks from the queue
   # ============================================================================
   airflow-worker:
-    build:
-      context: .
-      dockerfile: ./airflow/Dockerfile
+    image: ml-pipeline-airflow:local
     container_name: ml_pipeline_airflow_worker
     environment:
       AIRFLOW__CORE__EXECUTOR: CeleryExecutor
@@ -210,6 +238,19 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_ADDRESSING_STYLE: path
+      MAIL_SMTP_HOST: smtp.qq.com
+      MAIL_SMTP_PORT: "465"
+      MAIL_SMTP_MODE: ${MAIL_SMTP_MODE:-auto}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      ML_PIPELINE_ALERT_EMAIL: ${ML_PIPELINE_ALERT_EMAIL:-}
+      ML_PIPELINE_REUSE_TRAIN_CACHE: ${ML_PIPELINE_REUSE_TRAIN_CACHE:-false}
+      ML_PIPELINE_TRAIN_SAMPLE_RATIO: ${ML_PIPELINE_TRAIN_SAMPLE_RATIO:-0.2}
+      ML_PIPELINE_MODEL_NAME: ${ML_PIPELINE_MODEL_NAME:-mobilenet_v2}
+      ML_PIPELINE_NUM_EPOCHS: ${ML_PIPELINE_NUM_EPOCHS:-2}
+      ML_PIPELINE_BATCH_SIZE: ${ML_PIPELINE_BATCH_SIZE:-64}
+      ML_PIPELINE_EARLY_STOPPING_PATIENCE: ${ML_PIPELINE_EARLY_STOPPING_PATIENCE:-1}
       FEATURE_STORE_POSTGRES_HOST: postgres
       FEATURE_STORE_POSTGRES_DB: mlflow
       FEATURE_STORE_POSTGRES_USER: mlflow

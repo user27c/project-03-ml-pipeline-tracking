@@ -22,10 +22,18 @@ from typing import Dict, Any, Tuple, Optional
 import logging
 from pathlib import Path
 import time
+import json
+import subprocess
 import mlflow
 import mlflow.pytorch
+from mlflow.models.signature import infer_signature
 from datetime import datetime
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 # from data_ingestion import  
+from src.reproducibility import capture_env_snapshot, set_global_seed
 
 # Configure logging
 logging.basicConfig(
@@ -231,6 +239,134 @@ class ModelTrainer:
 
         logger.info(f"ModelTrainer已初始化。使用设备: {self.device}")
 
+    def _get_git_commit_hash(self) -> str:
+        """获取当前仓库的 git commit hash，失败时返回 unknown。"""
+        try:
+            root = Path(__file__).resolve().parent.parent
+            output = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=str(root), text=True
+            )
+            return output.strip()
+        except Exception:
+            return "unknown"
+
+    def _torch_env_info(self) -> Dict[str, Any]:
+        """采集训练环境信息（用于 FR-2.1/NFR-1 验收与排障）。"""
+        info: Dict[str, Any] = {
+            "torch_version": getattr(torch, "__version__", "unknown"),
+            "cuda_available": bool(torch.cuda.is_available()),
+        }
+        if torch.cuda.is_available():
+            try:
+                info["cuda_device_name"] = torch.cuda.get_device_name(0)
+                info["cuda_device_count"] = int(torch.cuda.device_count())
+            except Exception:
+                pass
+        try:
+            import torchvision
+
+            info["torchvision_version"] = getattr(torchvision, "__version__", "unknown")
+        except Exception:
+            pass
+        return info
+
+    def _create_backbone(self, model_name: str, pretrained: bool) -> nn.Module:
+        """
+        兼容 torchvision 新旧权重 API 的 backbone 创建（迁移学习）。
+        """
+        weights = None
+        if pretrained:
+            try:
+                if model_name == "resnet18":
+                    weights = models.ResNet18_Weights.DEFAULT  # type: ignore[attr-defined]
+                elif model_name == "mobilenet_v2":
+                    weights = models.MobileNet_V2_Weights.DEFAULT  # type: ignore[attr-defined]
+            except Exception:
+                weights = None
+
+        if model_name == "resnet18":
+            if weights is not None:
+                return models.resnet18(weights=weights)
+            return models.resnet18(pretrained=pretrained)
+        if model_name == "mobilenet_v2":
+            if weights is not None:
+                return models.mobilenet_v2(weights=weights)
+            return models.mobilenet_v2(pretrained=pretrained)
+        raise ValueError(f"未知模型: {model_name}")
+
+    def _save_training_curves(
+        self,
+        run_id: str,
+        train_losses: list,
+        val_losses: list,
+        train_accs: list,
+        val_accs: list,
+    ) -> Path:
+        """保存训练曲线图并返回路径。"""
+        plots_dir = Path(self.config.get("artifacts_path", "artifacts")) / run_id / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        curve_path = plots_dir / "training_curves.png"
+        epochs = list(range(1, len(train_losses) + 1))
+
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, train_losses, label="train_loss")
+        plt.plot(epochs, val_losses, label="val_loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training/Validation Loss")
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs, train_accs, label="train_acc")
+        plt.plot(epochs, val_accs, label="val_acc")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy (%)")
+        plt.title("Training/Validation Accuracy")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(curve_path, dpi=200)
+        plt.close()
+        return curve_path
+
+    def _save_training_metrics_json(self, run_id: str, payload: Dict[str, Any]) -> Path:
+        """保存训练指标 JSON 并返回路径。"""
+        metrics_dir = Path(self.config.get("artifacts_path", "artifacts")) / run_id / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = metrics_dir / "training_metrics.json"
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return metrics_path
+
+    def _export_onnx(self, model: nn.Module, sample_input: torch.Tensor, run_id: str) -> Optional[Path]:
+        """导出 ONNX；失败时返回 None（不中断主训练流程）。"""
+        model_dir = Path(self.config.get("artifacts_path", "artifacts")) / run_id / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        onnx_path = model_dir / "model.onnx"
+        try:
+            model.eval()
+            model_cpu = model.to("cpu")
+            sample_cpu = sample_input.detach().to("cpu")
+            torch.onnx.export(
+                model_cpu,
+                sample_cpu,
+                str(onnx_path),
+                export_params=True,
+                opset_version=13,
+                do_constant_folding=True,
+                input_names=["input"],
+                output_names=["logits"],
+                dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+            )
+            model.to(self.device)
+            logger.info(f"已导出 ONNX: {onnx_path}")
+            return onnx_path
+        except Exception as e:
+            logger.warning(f"ONNX 导出失败，已跳过: {e}")
+            model.to(self.device)
+            return None
+
     def create_model(
         self,
         num_classes: int,
@@ -258,18 +394,18 @@ class ModelTrainer:
         """
         logger.info(f"创建{model_name}模型，类数为{num_classes}")
 
+        pretrained = bool(self.config.get("pretrained", True))
+
         # 根据名称创建模型
         if model_name == "resnet18":
-            # 加载预训练的ResNet18
-            model = models.resnet18(pretrained=True)
+            model = self._create_backbone("resnet18", pretrained=pretrained)
             # 获取最终层的输入特征数
             num_features = model.fc.in_features
             # 替换最终层
             model.fc = nn.Linear(num_features, num_classes)
 
         elif model_name == "mobilenet_v2":
-            # 加载预训练的MobileNetV2
-            model = models.mobilenet_v2(pretrained=True)
+            model = self._create_backbone("mobilenet_v2", pretrained=pretrained)
             # 获取输入特征数
             num_features = model.classifier[1].in_features
             # 替换最终层
@@ -429,7 +565,8 @@ class ModelTrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         num_classes: int,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        manage_mlflow_run: bool = True,
     ) -> Tuple[nn.Module, float]:
         """
         带MLflow跟踪的完整训练管道。
@@ -468,17 +605,45 @@ class ModelTrainer:
         """
         logger.info("开始训练管道")
 
-        # 启动MLflow运行
-        run_name = f"train_{params['model_name']}_{int(time.time())}"
-        tags = {
-            "model_architecture": params['model_name'],
-            "framework": "pytorch",
-            "task": "image_classification"
-        }
-        self.tracker.start_run(run_name=run_name, tags=tags)
+        seed = int(params.get("seed", 42))
+        deterministic = bool(params.get("deterministic", True))
+        set_global_seed(seed, deterministic=deterministic)
+
+        # 启动/复用 MLflow run（用于 tuning 的 nested runs）
+        if manage_mlflow_run or mlflow.active_run() is None:
+            run_name = f"train_{params['model_name']}_{int(time.time())}"
+            tags = {
+                "model_architecture": params["model_name"],
+                "framework": "pytorch",
+                "task": "image_classification",
+            }
+            self.tracker.start_run(run_name=run_name, tags=tags)
+        active_run = mlflow.active_run()
+        run_id = active_run.info.run_id if active_run else "unknown_run"
 
         # 记录所有参数
         self.tracker.log_params(params)
+        self.tracker.log_params(
+            {
+                "git_commit_hash": self._get_git_commit_hash(),
+                "training_device": str(self.device),
+            }
+        )
+        self.tracker.log_params(self._torch_env_info())
+        # 记录环境快照（pip freeze 等）用于复现
+        try:
+            snap_dir = Path(self.config.get("artifacts_path", "artifacts")) / run_id / "reproducibility"
+            snap = capture_env_snapshot(snap_dir)
+            self.tracker.log_artifact(snap.pip_freeze_path)
+            self.tracker.log_params(
+                {
+                    "python_version": snap.python_version,
+                    "platform": snap.platform,
+                    "env_snapshot_utc": snap.created_at_utc,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"环境快照记录失败（已跳过，不影响训练）: {e}")
 
         # 创建模型
         model = self.create_model(num_classes, params['model_name'])
@@ -491,6 +656,8 @@ class ModelTrainer:
             optimizer = optim.Adam(model.parameters(), lr=params['learning_rate'])
         elif params['optimizer'] == 'sgd':
             optimizer = optim.SGD(model.parameters(), lr=params['learning_rate'], momentum=0.9)
+        else:
+            raise ValueError(f"未知 optimizer: {params['optimizer']!r}")
 
         # 创建学习率调度器
         scheduler = optim.lr_scheduler.StepLR(
@@ -503,7 +670,11 @@ class ModelTrainer:
         best_val_acc = 0.0
         epochs_without_improvement = 0
         best_model_path = Path(self.config['model_save_path']) / 'best_model.pth'
+        train_losses, val_losses = [], []
+        train_accs, val_accs = [], []
+        best_state_dict = None
 
+        train_start = time.time()
         #  训练循环
         for epoch in range(params['num_epochs']):
             epoch_start = time.time()
@@ -527,11 +698,18 @@ class ModelTrainer:
                 'val_accuracy': val_acc,
                 'learning_rate': optimizer.param_groups[0]['lr']
             }, step=epoch)
+            train_losses.append(float(train_loss))
+            val_losses.append(float(val_loss))
+            train_accs.append(float(train_acc))
+            val_accs.append(float(val_acc))
 
             #  保存最佳模型
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save(model.state_dict(), best_model_path)
+                best_state_dict = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
                 epochs_without_improvement = 0
                 logger.info(f"新的最佳模型！验证准确率: {val_acc:.2f}%")
             else:
@@ -547,17 +725,58 @@ class ModelTrainer:
             logger.info(f"轮次在{epoch_time:.2f}s内完成")
 
         #  记录最佳模型到MLflow
-        self.tracker.log_model(model, "model")
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+        model.eval()
+        sample_batch = next(iter(train_loader))[0][:1].to(self.device)
+        with torch.no_grad():
+            sample_output = model(sample_batch)
+        signature = infer_signature(
+            sample_batch.detach().cpu().numpy(),
+            sample_output.detach().cpu().numpy(),
+        )
+        self.tracker.log_model(
+            model,
+            "model",
+            input_example=sample_batch.detach().cpu().numpy(),
+            signature=signature,
+        )
         self.tracker.log_artifact(str(best_model_path))
+
+        curve_path = self._save_training_curves(
+            run_id, train_losses, val_losses, train_accs, val_accs
+        )
+        self.tracker.log_artifact(str(curve_path))
+
+        metrics_payload = {
+            "best_val_accuracy": float(best_val_acc),
+            "total_epochs": int(epoch + 1),
+            "history": {
+                "train_loss": train_losses,
+                "val_loss": val_losses,
+                "train_accuracy": train_accs,
+                "val_accuracy": val_accs,
+            },
+        }
+        metrics_json_path = self._save_training_metrics_json(run_id, metrics_payload)
+        self.tracker.log_artifact(str(metrics_json_path))
+
+        onnx_path = self._export_onnx(model, sample_batch, run_id)
+        if onnx_path:
+            self.tracker.log_artifact(str(onnx_path))
 
         #  记录最终指标
         self.tracker.log_metrics({
             'best_val_accuracy': best_val_acc,
             'total_epochs': epoch + 1
         })
+        self.tracker.log_metrics(
+            {"training_duration_sec": float(time.time() - train_start)}
+        )
 
-        #  结束MLflow运行
-        self.tracker.end_run()
+        #  结束MLflow运行（若由本函数创建）
+        if manage_mlflow_run:
+            self.tracker.end_run()
 
         logger.info(f"训练完成！最佳验证准确率: {best_val_acc:.2f}%")
 

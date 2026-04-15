@@ -14,11 +14,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -55,6 +57,8 @@ def _build_pipeline_config() -> dict:
         "processed_data_path": str(root / "data" / "processed"),
         "model_save_path": str(root / "models"),
         "artifacts_path": str(root / "artifacts"),
+        # 与评估阶段落盘路径一致，便于 DAG 将图表上传到 MLflow（见 evaluate_model）
+        "plots_dir": str(root / "artifacts" / "evaluation"),
         "mlflow_tracking_uri": _default_mlflow_tracking_uri(),
         "experiment_name": os.environ.get(
             "MLFLOW_EXPERIMENT_NAME", "image_classification_pipeline"
@@ -167,9 +171,17 @@ def _reuse_train_cache_enabled() -> bool:
     )
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _try_reuse_train_cache(all_splits_path: str, params: dict) -> tuple[bool, float]:
     """
-    若启用缓存且磁盘上存在与当前数据mtime、关键超参数一致的 checkpoint，则跳过训练。
+    若启用缓存且磁盘上存在与当前数据内容哈希、关键超参数一致的 checkpoint，则跳过训练。
 
     注意：跳过时不会新建 MLflow Training Run；evaluate仍使用 best_model.pth。
     register_model 仍取「最近一次」Run注册，若你依赖注册与本次权重严格一致，请勿开缓存或改注册逻辑。
@@ -191,11 +203,11 @@ def _try_reuse_train_cache(all_splits_path: str, params: dict) -> tuple[bool, fl
         logger.info("训练缓存未命中：all_splits 路径与缓存不一致")
         return False, 0.0
     try:
-        current_mtime_ns = Path(all_splits_path).stat().st_mtime_ns
+        current_hash = _file_sha256(Path(all_splits_path))
     except OSError:
         return False, 0.0
-    if meta.get("all_splits_mtime_ns") != current_mtime_ns:
-        logger.info("训练缓存未命中：all_splits.csv 已更新（mtime 变化）")
+    if meta.get("all_splits_sha256") != current_hash:
+        logger.info("训练缓存未命中：all_splits.csv 内容哈希变化")
         return False, 0.0
     cached_params = meta.get("params") or {}
     for key in _TRAIN_CACHE_PARAM_KEYS:
@@ -216,7 +228,7 @@ def _write_train_cache_meta(all_splits_path: str, best_val_acc: float, params: d
     p = Path(all_splits_path).resolve()
     meta = {
         "all_splits_path": str(p),
-        "all_splits_mtime_ns": p.stat().st_mtime_ns,
+        "all_splits_sha256": _file_sha256(p),
         "best_val_acc": float(best_val_acc),
         "params": {k: params.get(k) for k in _TRAIN_CACHE_PARAM_KEYS},
         "written_at": datetime.utcnow().isoformat() + "Z",
@@ -225,6 +237,24 @@ def _write_train_cache_meta(all_splits_path: str, best_val_acc: float, params: d
         json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     logger.info("已写入训练缓存元数据: %s", _train_cache_meta_path())
+
+
+def _latest_experiment_run_id() -> Optional[str]:
+    """当前实验下最近一次 Run（与 register_model 一致），用于在训练已 end_run 后补传评估工件。"""
+    import mlflow
+
+    mlflow.set_tracking_uri(PIPELINE_CONFIG["mlflow_tracking_uri"])
+    experiment = mlflow.get_experiment_by_name(PIPELINE_CONFIG["experiment_name"])
+    if experiment is None:
+        return None
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if runs is None or runs.empty:
+        return None
+    return str(runs.iloc[0]["run_id"])
 
 
 def _ensure_mlflow_artifact_bucket() -> None:
@@ -443,23 +473,63 @@ def store_features(**context):
 
 def train_model(**context):
     logger.info("Starting model training...")
+    import pandas as pd
     from src.dataset import create_data_loaders
     from src.training import MLflowTracker, ModelTrainer
 
     _ensure_mlflow_artifact_bucket()
 
     all_splits_path = _get_all_splits_csv_path(context)
+    train_sample_ratio = float(os.environ.get("ML_PIPELINE_TRAIN_SAMPLE_RATIO", "0.2"))
+    if train_sample_ratio <= 0:
+        train_sample_ratio = 0.2
+    if train_sample_ratio > 1:
+        train_sample_ratio = 1.0
+
+    sampled_splits_path = all_splits_path
+    if train_sample_ratio < 1.0:
+        df_all = pd.read_csv(all_splits_path)
+        sampled_frames = []
+        # 训练/验证按比例采样，测试集保留全部以保证评估稳定
+        for split in ("train", "val"):
+            df_split = df_all[df_all["split"] == split]
+            if df_split.empty:
+                continue
+            n = max(1, int(len(df_split) * train_sample_ratio))
+            sampled_frames.append(df_split.sample(n=n, random_state=42))
+        sampled_frames.append(df_all[df_all["split"] == "test"])
+        sampled_df = pd.concat(sampled_frames, ignore_index=True)
+        sampled_splits_path = str(
+            Path(PIPELINE_CONFIG["processed_data_path"]) / "all_splits.fast.csv"
+        )
+        sampled_df.to_csv(sampled_splits_path, index=False)
+        logger.warning(
+            "快速训练模式已启用：train/val 采样比例=%.2f，采样后总样本=%d",
+            train_sample_ratio,
+            len(sampled_df),
+        )
+
+    # NFR-1: 记录数据内容哈希用于复现
+    data_sha256 = _file_sha256(Path(sampled_splits_path))
     params = {
-        "model_name": "resnet18",
-        "num_epochs": 10,
-        "batch_size": 32,
-        "learning_rate": 0.001,
+        "model_name": os.environ.get("ML_PIPELINE_MODEL_NAME", "mobilenet_v2"),
+        "num_epochs": int(os.environ.get("ML_PIPELINE_NUM_EPOCHS", "2")),
+        "batch_size": int(os.environ.get("ML_PIPELINE_BATCH_SIZE", "64")),
+        "learning_rate": float(os.environ.get("ML_PIPELINE_LEARNING_RATE", "0.001")),
         "optimizer": "adam",
         "lr_step_size": 5,
         "lr_gamma": 0.1,
-        "early_stopping_patience": 3,
+        "early_stopping_patience": int(
+            os.environ.get("ML_PIPELINE_EARLY_STOPPING_PATIENCE", "1")
+        ),
+        "seed": int(os.environ.get("ML_PIPELINE_SEED", "42")),
+        "deterministic": os.environ.get("ML_PIPELINE_DETERMINISTIC", "true").lower()
+        in ("1", "true", "yes"),
+        "data_sha256": data_sha256,
+        "data_csv": str(Path(sampled_splits_path).resolve()),
     }
-    reused, cached_acc = _try_reuse_train_cache(all_splits_path, params)
+    context["task_instance"].xcom_push(key="trained_model_name", value=params["model_name"])
+    reused, cached_acc = _try_reuse_train_cache(sampled_splits_path, params)
     if reused:
         context["task_instance"].xcom_push(
             key="best_val_acc", value=float(cached_acc)
@@ -469,7 +539,7 @@ def train_model(**context):
 
     root_dir = str(PROJECT_ROOT)
     train_loader, val_loader, _ = create_data_loaders(
-        csv_path=all_splits_path,
+        csv_path=sampled_splits_path,
         root_dir=root_dir,
         batch_size=params["batch_size"],
         num_workers=0,
@@ -489,7 +559,7 @@ def train_model(**context):
         num_classes=num_classes,
         params=params,
     )
-    _write_train_cache_meta(all_splits_path, best_val_acc, params)
+    _write_train_cache_meta(sampled_splits_path, best_val_acc, params)
     context["task_instance"].xcom_push(
         key="best_val_acc", value=float(best_val_acc)
     )
@@ -516,6 +586,9 @@ def evaluate_model(**context):
         pin_memory=False,
     )
     model_path = f"{PIPELINE_CONFIG['model_save_path']}/best_model.pth"
+    preferred_model_name = context["task_instance"].xcom_pull(
+        task_ids="train_model", key="trained_model_name"
+    )
     try:
         model_payload = torch.load(
             model_path,
@@ -528,8 +601,29 @@ def evaluate_model(**context):
     # training.py 保存的是 state_dict；这里兼容 state_dict 与完整模型对象两种格式。
     if isinstance(model_payload, (dict, OrderedDict)):
         num_classes = test_loader.dataset.num_classes
-        model = models.resnet18(weights=None)
-        model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+        if preferred_model_name == "mobilenet_v2":
+            model = models.mobilenet_v2(weights=None)
+            model.classifier[1] = torch.nn.Linear(
+                model.classifier[1].in_features, num_classes
+            )
+            logger.info("Using model architecture from train_model XCom: mobilenet_v2")
+        elif preferred_model_name == "resnet18":
+            model = models.resnet18(weights=None)
+            model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+            logger.info("Using model architecture from train_model XCom: resnet18")
+        else:
+            # 兜底：根据权重键名推断架构
+            sample_keys = list(model_payload.keys())
+            if any(k.startswith("features.") for k in sample_keys):
+                model = models.mobilenet_v2(weights=None)
+                model.classifier[1] = torch.nn.Linear(
+                    model.classifier[1].in_features, num_classes
+                )
+                logger.warning("Inferred mobilenet_v2 from state_dict keys")
+            else:
+                model = models.resnet18(weights=None)
+                model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+                logger.warning("Inferred resnet18 from state_dict keys")
         model.load_state_dict(model_payload)
         logger.info("Loaded model from state_dict checkpoint")
     else:
@@ -549,7 +643,39 @@ def evaluate_model(**context):
         "truck",
     ]
     evaluator = ModelEvaluator(PIPELINE_CONFIG, class_names)
-    metrics = evaluator.evaluate(model, test_loader)
+    metrics = evaluator.evaluate(
+        model, test_loader, model_arch=preferred_model_name
+    )
+
+    # evaluate() 未传入活跃 MLflow run（训练任务里已 end_run），此处用 Client 挂到同实验最近一次训练 Run。
+    run_id = _latest_experiment_run_id()
+    if run_id:
+        from mlflow.tracking import MlflowClient
+
+        client = MlflowClient()
+        plots_dir = Path(PIPELINE_CONFIG["plots_dir"])
+        for filename in (
+            "confusion_matrix.png",
+            "prediction_samples.png",
+            "gradcam_samples.png",
+            "classification_report.txt",
+            "test_metrics.json",
+        ):
+            fp = plots_dir / filename
+            if fp.is_file():
+                try:
+                    client.log_artifact(run_id, str(fp), artifact_path="evaluation")
+                    logger.info("已上传评估工件到 MLflow: %s", fp)
+                except Exception as e:
+                    logger.warning("上传评估工件失败 %s: %s", fp, e)
+            else:
+                logger.warning("评估输出文件不存在，跳过上传: %s", fp)
+    else:
+        logger.warning(
+            "未找到可关联的 MLflow run（实验可能为空）；评估图表仅保存在磁盘: %s",
+            PIPELINE_CONFIG.get("plots_dir"),
+        )
+
     context["task_instance"].xcom_push(
         key="test_metrics", value=_xcom_safe_metrics(metrics)
     )
@@ -590,23 +716,147 @@ def register_model(**context):
         raise ValueError("未找到可注册的 MLflow run（search_runs 为空）")
     run_id = runs.iloc[0]["run_id"]
     model_uri = f"runs:/{run_id}/model"
+    preferred_model_name = context["task_instance"].xcom_pull(
+        task_ids="train_model", key="trained_model_name"
+    ) or "unknown"
+    data_sha256 = None
+    try:
+        # best-effort: pull from train_model params via cache meta if present
+        meta_path = Path(PIPELINE_CONFIG["model_save_path"]) / "train_cache_meta.json"
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            data_sha256 = meta.get("all_splits_sha256")
+    except Exception:
+        data_sha256 = None
+
     result = mlflow.register_model(model_uri=model_uri, name="image_classifier")
     client = mlflow.tracking.MlflowClient()
+
+    # 补齐元数据（FR-3.3）：可搜索、可追溯
+    tags = {
+        "architecture": str(preferred_model_name),
+        "framework": "pytorch",
+        "test_accuracy": str(acc),
+        "experiment": PIPELINE_CONFIG["experiment_name"],
+    }
+    if data_sha256:
+        tags["data_sha256"] = str(data_sha256)
+    for k, v in tags.items():
+        try:
+            client.set_model_version_tag("image_classifier", result.version, k, v)
+        except Exception:
+            pass
+
+    desc = (
+        f"{preferred_model_name} trained via Airflow DAG ml_training_pipeline. "
+        f"test_accuracy={acc:.4f}. "
+        f"run_id={run_id}."
+    )
+    try:
+        client.update_model_version(
+            name="image_classifier", version=result.version, description=desc
+        )
+    except Exception:
+        pass
+
+    # 生命周期阶段：默认 Staging；可选自动晋升 Production（会归档旧 Production，保证唯一）
+    promote = os.environ.get("ML_PIPELINE_PROMOTE_TO_PROD", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    target_stage = "Production" if promote else "Staging"
     client.transition_model_version_stage(
         name="image_classifier",
         version=result.version,
-        stage="Staging",
+        stage=target_stage,
+        archive_existing_versions=promote,
     )
-    logger.info("Registered model version %s", result.version)
-    return f"Model registered: version {result.version}"
+    logger.info("Registered model version %s -> %s", result.version, target_stage)
+    return f"Model registered: version {result.version} stage={target_stage}"
 
 
 def notify_pipeline_success(**context):
-    """避免未配置 SMTP 时 EmailOperator 导致失败；需要邮件可改回 EmailOperator。"""
+    """
+    发送成功通知邮件（通过环境变量配置 SMTP）；若未配置则仅记录日志。
+
+    必要环境变量示例（请在部署环境设置，不要写入仓库）：
+    - MAIL_SMTP_HOST=smtp.qq.com
+    - MAIL_SMTP_PORT=465
+    - MAIL_USERNAME=xxx@qq.com
+    - MAIL_PASSWORD=<邮箱授权码>
+    - ML_PIPELINE_ALERT_EMAIL=收件人邮箱（默认同 MAIL_USERNAME）
+    """
     ds = context.get("ds")
     uri = PIPELINE_CONFIG["mlflow_tracking_uri"]
-    logger.info("ML 管道已成功完成。ds=%s MLflow=%s", ds, uri)
-    return "notification logged"
+    host = os.environ.get("MAIL_SMTP_HOST")
+    port = int(os.environ.get("MAIL_SMTP_PORT", "465"))
+    mode = os.environ.get("MAIL_SMTP_MODE", "auto").lower()
+    username = os.environ.get("MAIL_USERNAME")
+    password = os.environ.get("MAIL_PASSWORD")
+    receiver = os.environ.get("ML_PIPELINE_ALERT_EMAIL") or username
+    if not (host and username and password and receiver):
+        logger.info("ML 管道已成功完成。未配置邮件参数，仅记录日志。ds=%s MLflow=%s", ds, uri)
+        return "notification skipped (smtp not configured)"
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.header import Header
+
+    subject = "[成功] ML训练管道完成"
+    body = (
+        f"执行日期: {ds}\n"
+        f"状态: 成功\n"
+        f"MLflow: {uri}\n"
+        "Airflow DAG: ml_training_pipeline\n"
+    )
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["From"] = str(Header(username))
+    msg["To"] = str(Header(receiver))
+    msg["Subject"] = str(Header(subject, "utf-8"))
+
+    def _send_with_ssl(target_port: int) -> None:
+        with smtplib.SMTP_SSL(host, target_port, timeout=20) as server:
+            server.ehlo()
+            server.login(username, password)
+            server.sendmail(username, [receiver], msg.as_string())
+
+    def _send_with_starttls(target_port: int) -> None:
+        with smtplib.SMTP(host, target_port, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(username, password)
+            server.sendmail(username, [receiver], msg.as_string())
+
+    attempts = []
+    if mode == "ssl":
+        attempts = [("ssl", port)]
+    elif mode == "starttls":
+        attempts = [("starttls", port)]
+    else:
+        # auto: 先 SSL(当前端口或465)，再 STARTTLS(587) 兜底
+        attempts = [("ssl", port), ("ssl", 465), ("starttls", 587)]
+
+    last_error = None
+    for method, try_port in attempts:
+        try:
+            if method == "ssl":
+                _send_with_ssl(try_port)
+            else:
+                _send_with_starttls(try_port)
+            logger.info("成功通知邮件已发送至: %s (%s:%s %s)", receiver, host, try_port, method)
+            return f"notification sent to {receiver}"
+        except Exception as e:
+            last_error = e
+            logger.warning("邮件发送尝试失败: host=%s port=%s method=%s err=%s", host, try_port, method, e)
+
+    try:
+        raise last_error if last_error else RuntimeError("unknown smtp error")
+    except Exception as e:
+        # 通知属于非关键路径：训练与评估完成后，邮件失败不应导致 DAG 最终失败。
+        logger.warning("邮件发送失败，已降级为日志通知: %s", e)
+        return f"notification degraded to log ({type(e).__name__})"
 
 
 # ============================================================================

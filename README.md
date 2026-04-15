@@ -25,30 +25,30 @@
 | MinIO 桶与工件（可选） | `result_img/demo_minio.png` | `mlflow` 桶或 DVC 远程 |
 | 评估曲线或混淆矩阵（可选） | `result_img/demo_evaluation.png` | 来自 `evaluation` 产出 |
 
-**占位图（放入同名文件后即显示）：**
+<!-- **占位图（放入同名文件后即显示）：** -->
 
 <p align="center">
 
 <!-- 将 demo_architecture.png 放入 result_img/ -->
-<img src="result_img/demo_architecture.png" alt="架构 / 数据流演示（请将图片放到 result_img/demo_architecture.png）" width="720"/>
+<img src="result_img/image copy 9.png" alt="架构 / 数据流演示（请将图片放到 result_img/demo_architecture.png）" width="720"/>
 
 </p>
 
 <p align="center">
 
 <!-- 将 demo_airflow_dag.png 放入 result_img/ -->
-<img src="result_img/demo_airflow_dag.png" alt="Airflow DAG 演示（请将图片放到 result_img/demo_airflow_dag.png）" width="720"/>
+<img src="result_img/image copy.png" alt="Airflow DAG 演示（请将图片放到 result_img/demo_airflow_dag.png）" width="720"/>
 
 </p>
 
 <p align="center">
 
 <!-- 将 demo_mlflow_ui.png 放入 result_img/ -->
-<img src="result_img/demo_mlflow_ui.png" alt="MLflow 演示（请将图片放到 result_img/demo_mlflow_ui.png）" width="720"/>
+<img src="result_img/image copy 7.png" alt="MLflow 演示（请将图片放到 result_img/demo_mlflow_ui.png）" width="720"/>
 
 </p>
 
-> **说明：** 在图片尚未加入前，部分 Markdown 预览器会显示裂图，属正常现象；补齐 `result_img/` 内文件即可。
+<!-- > **说明：** 在图片尚未加入前，部分 Markdown 预览器会显示裂图，属正常现象；补齐 `result_img/` 内文件即可。 -->
 
 ---
 
@@ -134,7 +134,11 @@ project-03-ml-pipeline-tracking/
 | `MLFLOW_ARTIFACT_BUCKET` | MLflow 工件桶名（默认 `mlflow`）。DAG 在训练前会尝试自动检查/创建该桶。 |
 | `FEATURE_STORE_POSTGRES_HOST` / `FEATURE_STORE_POSTGRES_*` | 特征库连接 |
 | `ML_PIPELINE_ALERT_EMAIL` | 若设置，则启用失败邮件相关默认行为（视 Airflow SMTP 配置而定） |
+| `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` / `MAIL_USERNAME` / `MAIL_PASSWORD` | 成功通知邮件 SMTP 配置（DAG `send_success_email` 任务读取；建议通过环境变量注入，不写入仓库） |
 | `ML_PIPELINE_REUSE_TRAIN_CACHE` | 设为 `1` / `true` 时，若 `models/best_model.pth` 与 `models/train_cache_meta.json` 存在且与当前 `all_splits.csv` 的 mtime、关键超参数一致，则 **跳过训练**（调下游步骤时省时间）。见 DAG 内说明；**跳过时不会新建 MLflow 训练 Run**，`register_model` 仍关联「最近一次 Run」，需注意一致性。 |
+| `ML_PIPELINE_SEED` | 全局随机种子（默认 42），用于训练/采样可复现 |
+| `ML_PIPELINE_DETERMINISTIC` | 是否启用尽力 deterministic（默认 true） |
+| `ML_PIPELINE_PROMOTE_TO_PROD` | 设为 `1/true` 时注册后自动晋升到 Production，并归档旧 Production（保证唯一） |
 
 ---
 
@@ -146,6 +150,42 @@ project-03-ml-pipeline-tracking/
 2. 按 `docker-compose.yml` 文末注释完成 **Airflow DB 初始化、管理员用户、MinIO `mlflow` 桶** 等一次性步骤。
 3. 重新构建 Airflow 镜像以纳入代码与依赖变更：`docker compose build --no-cache` 后再 `up`。
 4. 浏览器：**Airflow** 常为 `http://localhost:8080`，**MLflow** `http://localhost:5000`。
+
+---
+
+## 7.3 超参数调优（FR-2.2）
+
+本项目提供网格搜索版调参入口（>=10 组配置），所有 trial 都会写入 MLflow。
+
+- **方式 A（推荐）**：在能访问 MLflow 的 Python 环境运行：
+
+```bash
+MLFLOW_TRACKING_URI="http://localhost:5000" \
+python src/hyperparameter_tuning.py \
+  --csv-path "data/processed/all_splits.csv" \
+  --root-dir "." \
+  --n-trials 10 \
+  --num-epochs 2
+```
+
+- **方式 B（MLproject）**：`mlflow run . -e tune -P n_trials=10`（依赖 `mlflow/MLproject`）。
+
+调参完成后：
+- 在 MLflow 对应实验中会看到一个 parent run（`tune_grid_*`）与多个 nested trial runs
+- parent run 的 artifacts 下会有 `best_config.json`
+
+---
+
+## 7.4 模型注册与回滚（FR-3）
+
+- **注册**：DAG 的 `register_model` 会把满足阈值的模型注册为 `image_classifier`，默认进入 `Staging`。
+- **自动晋升 Production（可选）**：设置 `ML_PIPELINE_PROMOTE_TO_PROD=true`，会晋升到 `Production` 并自动归档旧 Production（保证唯一）。
+- **回滚**：将指定版本切换到 Production：
+
+```bash
+MLFLOW_TRACKING_URI="http://localhost:5000" \
+python scripts/rollback_model.py --version 3
+```
 
 ### 7.2 本机 Conda / venv + Airflow
 

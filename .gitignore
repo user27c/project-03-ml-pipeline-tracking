@@ -1,0 +1,5 @@
+.env
+.cursorrules
+cache/
+tmp/
+__pycache__/

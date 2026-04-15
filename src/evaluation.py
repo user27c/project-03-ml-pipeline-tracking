@@ -14,15 +14,19 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, classification_report
 )
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
 import json
@@ -33,6 +37,157 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _denorm_cifar_style(tensor_chw: torch.Tensor) -> np.ndarray:
+    """与 dataset.py 中 eval 变换一致: Normalize(0.5,0.5) -> 显示 RGB [0,1]。"""
+    x = tensor_chw.detach().float().cpu().clone()
+    mean = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
+    std = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
+    x = (x * std + mean).clamp(0.0, 1.0)
+    return x.numpy().transpose(1, 2, 0)
+
+
+def _forward_activation_shape(
+    model: nn.Module, layer: nn.Module, x: torch.Tensor
+) -> Optional[Tuple[int, int, int, int]]:
+    """对单层注册 hook，跑一次完整前向，返回该层输出 shape (N,C,H,W)；非 4D 则 None。"""
+    shape_holder: list = []
+
+    def _hook(_m: nn.Module, _inp: Any, out: torch.Tensor) -> None:
+        if torch.is_tensor(out) and out.dim() == 4:
+            shape_holder.append(tuple(out.shape))
+
+    h = layer.register_forward_hook(_hook)
+    try:
+        model.eval()
+        with torch.no_grad():
+            model(x)
+    finally:
+        h.remove()
+    return shape_holder[0] if shape_holder else None
+
+
+def _pick_gradcam_layer(
+    model: nn.Module, x_sample: torch.Tensor, arch_hint: Optional[str] = None
+) -> Optional[nn.Module]:
+    """
+    从靠近输出的卷积块向前搜索，选用空间尺寸 >=2 的最深一层（小输入下避免 1x1 特征图）。
+    """
+    candidates: List[nn.Module] = []
+    if hasattr(model, "layer1"):
+        candidates.extend(
+            [model.layer1, model.layer2, model.layer3, model.layer4]
+        )
+    if hasattr(model, "features") and isinstance(model.features, nn.Sequential):
+        candidates.extend(list(model.features.children()))
+    if not candidates:
+        return None
+
+    device = next(model.parameters()).device
+    x = x_sample[:1].to(device)
+    chosen: Optional[nn.Module] = None
+    chosen_shape: Optional[Tuple[int, int, int, int]] = None
+    for lyr in reversed(candidates):
+        if not any(True for _ in lyr.parameters()):
+            continue
+        try:
+            sh = _forward_activation_shape(model, lyr, x)
+        except Exception:
+            continue
+        if not sh or len(sh) != 4:
+            continue
+        _, _, hh, ww = sh
+        if hh < 2 or ww < 2:
+            continue
+        chosen = lyr
+        chosen_shape = sh
+        break
+    if chosen is not None:
+        logger.info(
+            "Grad-CAM 使用目标层: %s (arch_hint=%r, act shape=%s)",
+            type(chosen).__name__,
+            arch_hint,
+            chosen_shape,
+        )
+    else:
+        logger.warning(
+            "Grad-CAM: 未找到合适卷积层 (arch_hint=%r)",
+            arch_hint,
+        )
+    return chosen
+
+
+class _GradCAM:
+    """标准 Grad-CAM：对目标层激活与梯度做通道加权。"""
+
+    def __init__(self, model: nn.Module, target_layer: nn.Module) -> None:
+        self.model = model
+        self.target_layer = target_layer
+        self.activations: Optional[torch.Tensor] = None
+        self.gradients: Optional[torch.Tensor] = None
+        self._fh = target_layer.register_forward_hook(self._save_act)
+        self._bh = target_layer.register_full_backward_hook(self._save_grad)
+
+    def _save_act(
+        self, _m: nn.Module, _inp: Any, out: torch.Tensor
+    ) -> None:
+        self.activations = out
+
+    def _save_grad(
+        self, _m: nn.Module, _grad_in: Any, grad_out: Any
+    ) -> None:
+        if grad_out[0] is not None:
+            self.gradients = grad_out[0]
+
+    def remove(self) -> None:
+        self._fh.remove()
+        self._bh.remove()
+
+    def compute(
+        self, x: torch.Tensor, target_class: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        x: (1, C, H, W)。返回 (H_img, W_img) 的归一化 CAM，与输入图同空间尺寸。
+        """
+        self.model.eval()
+        self.activations = None
+        self.gradients = None
+        x = x.detach().requires_grad_(True)
+        out = self.model(x)
+        if target_class is None:
+            target_class = int(out.argmax(dim=1).item())
+        self.model.zero_grad(set_to_none=True)
+        score = out[0, target_class]
+        score.backward(retain_graph=False)
+        acts = self.activations
+        grads = self.gradients
+        if acts is None or grads is None:
+            raise RuntimeError("Grad-CAM: 未捕获到激活或梯度")
+        # acts, grads: (1, C, h, w)
+        a0 = acts[0]
+        g0 = grads[0]
+        weights = g0.mean(dim=(1, 2))  # (C,)
+        cam = (weights[:, None, None] * a0).sum(dim=0)
+        cam = F.relu(cam)
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        cam_up = F.interpolate(
+            cam.view(1, 1, *cam.shape),
+            size=x.shape[2:],
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        return cam_up.detach().float().cpu().numpy()
+
+
+def _overlay_heatmap_on_image(
+    rgb_01: np.ndarray, cam_hw: np.ndarray, alpha: float = 0.45
+) -> np.ndarray:
+    """rgb_01: H,W,3 in [0,1]; cam_hw: H,W in [0,1]"""
+    heat = plt.cm.jet(cam_hw)[:, :, :3]
+    out = (1.0 - alpha) * rgb_01 + alpha * heat
+    return np.clip(out, 0.0, 1.0)
 
 
 class ModelEvaluator:
@@ -69,13 +224,10 @@ class ModelEvaluator:
         self.config = config
         self.class_names = class_names
 
-        # Set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.device = None
-
         # Create plots directory
-        self.plots_dir = Path(config.get('plots_dir', 'plots'))
+        self.plots_dir = Path(config.get("plots_dir", "plots"))
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"ModelEvaluator initialized with {len(class_names)} classes")
@@ -355,11 +507,114 @@ class ModelEvaluator:
 
         logger.info(f"Saved metrics to {save_path}")
 
+    def plot_prediction_samples(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        labels: torch.Tensor,
+        save_path: Optional[Path] = None,
+    ) -> Path:
+        """网格展示若干测试样本：真值 vs 预测（与 dataset 评估变换一致的反归一化显示）。"""
+        model.eval()
+        cap = int(self.config.get("eval_prediction_samples", 12))
+        n_tot = images.size(0)
+        n = max(1, min(cap, n_tot))
+        images = images[:n].to(self.device)
+        labels = labels[:n].to(self.device)
+        with torch.no_grad():
+            pred = model(images).argmax(dim=1)
+        cols = 4
+        rows = (n + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.2, rows * 2.5))
+        axes_flat = np.atleast_1d(axes).ravel()
+        for i in range(n):
+            ax = axes_flat[i]
+            img = _denorm_cifar_style(images[i])
+            ax.imshow(img)
+            ti, pi = int(labels[i]), int(pred[i])
+            tn, pn = self.class_names[ti], self.class_names[pi]
+            ok = ti == pi
+            ax.set_title(
+                f"T: {tn}\nP: {pn}",
+                fontsize=8,
+                color=("green" if ok else "red"),
+            )
+            ax.axis("off")
+        for j in range(n, len(axes_flat)):
+            axes_flat[j].axis("off")
+        fig.suptitle("Prediction samples (T=true, P=predicted)", fontsize=11, y=1.02)
+        plt.tight_layout()
+        path = Path(save_path) if save_path else self.plots_dir / "prediction_samples.png"
+        plt.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close()
+        logger.info("Saved prediction samples to %s", path)
+        return path
+
+    def plot_gradcam_samples(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        labels: torch.Tensor,
+        model_arch: Optional[str] = None,
+        save_path: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """对若干样本做 Grad-CAM（解释模型预测类别）并叠加热力图。"""
+        cap = int(self.config.get("eval_gradcam_samples", 6))
+        n = min(cap, images.size(0))
+        if n < 1:
+            return None
+        model = model.to(self.device)
+        images = images[:n].to(self.device)
+        labels_cpu = labels[:n].detach().cpu()
+        layer = _pick_gradcam_layer(model, images, model_arch)
+        if layer is None:
+            return None
+        gc = _GradCAM(model, layer)
+        path: Optional[Path] = None
+        try:
+            cols = min(3, n)
+            rows = (n + cols - 1) // cols
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.6, rows * 2.6))
+            axes_flat = np.atleast_1d(axes).ravel()
+            for i in range(n):
+                xi = images[i : i + 1].detach()
+                with torch.no_grad():
+                    pred_cls = int(model(xi).argmax(dim=1).item())
+                cam = gc.compute(xi, target_class=pred_cls)
+                rgb = _denorm_cifar_style(images[i])
+                overlay = _overlay_heatmap_on_image(rgb, cam, alpha=0.48)
+                ax = axes_flat[i]
+                ax.imshow(overlay)
+                ti = int(labels_cpu[i].item())
+                ax.set_title(
+                    f"P: {self.class_names[pred_cls]}\n"
+                    f"T: {self.class_names[ti]}",
+                    fontsize=8,
+                )
+                ax.axis("off")
+            for j in range(n, len(axes_flat)):
+                axes_flat[j].axis("off")
+            fig.suptitle(
+                "Grad-CAM (explains predicted class)", fontsize=11, y=1.02
+            )
+            plt.tight_layout()
+            path = Path(save_path) if save_path else self.plots_dir / "gradcam_samples.png"
+            plt.savefig(path, dpi=200, bbox_inches="tight")
+            plt.close()
+            logger.info("Saved Grad-CAM samples to %s", path)
+        except Exception as e:
+            logger.warning("Grad-CAM 生成失败，跳过: %s", e)
+            path = None
+        finally:
+            gc.remove()
+        return path
+
     def evaluate(
         self,
         model: nn.Module,
         test_loader: DataLoader,
-        mlflow_tracker: Optional[Any] = None
+        mlflow_tracker: Optional[Any] = None,
+        model_arch: Optional[str] = None,
     ) -> Dict[str, float]:
         """
         运行完整的评估流程。
@@ -368,6 +623,7 @@ class ModelEvaluator:
             model: 要评估的训练模型
             test_loader: 测试数据加载器
             mlflow_tracker: 可选的用于记录的MLflow跟踪器
+            model_arch: 可选，如 ``mobilenet_v2`` / ``resnet18``，用于 Grad-CAM 层选择日志与调试
 
         返回：
             包含所有计算指标的字典
@@ -379,12 +635,19 @@ class ModelEvaluator:
         4. 绘制混淆矩阵
         5. 生成分类报告
         6. 保存所有工件
-        7. 如果提供了跟踪器则记录到MLflow
-        8. 返回指标
+        7. 使用 test_loader 的首个 batch 生成 ``prediction_samples.png`` 与 ``gradcam_samples.png``
+           （数量可由 config 中 ``eval_prediction_samples`` / ``eval_gradcam_samples`` 覆盖）
+        8. 如果提供了跟踪器则记录到MLflow
+        9. 返回指标
 
         这是运行所有评估步骤的主入口点。
         """
         logger.info("Starting comprehensive model evaluation...")
+
+        try:
+            viz_images, viz_labels = next(iter(test_loader))
+        except StopIteration:
+            viz_images, viz_labels = None, None  # type: ignore
 
         # Step 1 - Generate predictions
         y_true, y_pred = self.predict(model, test_loader)
@@ -408,12 +671,26 @@ class ModelEvaluator:
         metrics_path = self.plots_dir / 'test_metrics.json'
         self.save_metrics(metrics, metrics_path)
 
+        samples_path: Optional[Path] = None
+        gradcam_path: Optional[Path] = None
+        if viz_images is not None and viz_labels is not None:
+            samples_path = self.plot_prediction_samples(
+                model, viz_images, viz_labels
+            )
+            gradcam_path = self.plot_gradcam_samples(
+                model, viz_images, viz_labels, model_arch=model_arch
+            )
+
         # Step 7 - Log to MLflow if available
         if mlflow_tracker:
             mlflow_tracker.log_metrics(metrics)
             mlflow_tracker.log_artifact(str(cm_plot_path))
             mlflow_tracker.log_artifact(str(report_path))
             mlflow_tracker.log_artifact(str(metrics_path))
+            if samples_path and samples_path.is_file():
+                mlflow_tracker.log_artifact(str(samples_path))
+            if gradcam_path and gradcam_path.is_file():
+                mlflow_tracker.log_artifact(str(gradcam_path))
 
         logger.info("Evaluation complete!")
 
